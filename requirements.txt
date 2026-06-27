@@ -1,0 +1,4 @@
+# research-helper dependencies
+# All other modules use Python stdlib only.
+faiss-cpu>=1.7.4
+numpy>=1.24.0

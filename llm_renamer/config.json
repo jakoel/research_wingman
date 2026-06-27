@@ -1,0 +1,77 @@
+{
+  "idasql": {
+    "url": "http://localhost:8081",
+    "timeout_seconds": 30
+  },
+  "ollama": {
+    "url": "http://localhost:11434",
+    "model": "codellama:13b-instruct",
+    "timeout_seconds": 120,
+    "temperature": 0.1,
+    "num_ctx": 8192
+  },
+  "analysis": {
+    "confidence_threshold": 0.65,
+    "max_name_length": 64,
+    "min_pseudocode_lines": 3,
+    "max_pseudocode_lines": 200,
+    "skip_high_risk": true
+  },
+  "policy": {
+    "never_overwrite_analyst_names": true,
+    "auto_generated_prefixes": [
+      "sub_", "j_", "nullsub_", "locret_", "loc_"
+    ],
+    "vague_names_blacklist": [
+      "process_data", "handle_stuff", "helper", "wrapper",
+      "unknown_function", "do_something", "function", "func",
+      "handle", "process", "execute", "run", "init", "cleanup",
+      "setup", "teardown", "main_func", "common_func",
+      "utility_func", "generic_func", "sub_routine", "routine",
+      "method", "callback", "handler", "handler_func",
+      "do_work", "work", "task", "operation", "perform",
+      "check", "get_data", "set_data", "read_data", "write_data"
+    ],
+    "conflict_suffix_max": 9
+  },
+  "scoring": {
+    "sink_bonus": 3,
+    "input_reachable_bonus": 5,
+    "low_complexity_bonus": 2,
+    "low_complexity_threshold": 5,
+    "xref_focus_thresholds": {
+      "focused_max": 3,
+      "focused_bonus": 4,
+      "moderate_max": 10,
+      "moderate_bonus": 1,
+      "utility_min": 51,
+      "utility_penalty": 2,
+      "heavy_utility_min": 201,
+      "heavy_utility_penalty": 5
+    }
+  },
+  "graph": {
+    "timeout_seconds": 300,
+    "cache_filename": "call_graph.json",
+    "dangerous_sinks": [
+      "memcpy", "memmove", "strcpy", "strcat", "sprintf", "vsprintf",
+      "gets", "recv", "recvfrom", "read", "malloc", "realloc", "free"
+    ],
+    "input_sink_apis": [
+      "recv", "recvfrom", "read", "fgets", "fread",
+      "WSARecv", "ReadFile", "getchar", "scanf", "fscanf"
+    ]
+  },
+  "kb": {
+    "sqlite_filename": "knowledge_base.sqlite",
+    "faiss_filename": "kb_vectors.faiss",
+    "embed_model": "nomic-embed-text",
+    "refinement_confidence_skip": 0.85
+  },
+  "output": {
+    "dir": null,
+    "review_filename": "llm_renames_review.json",
+    "audit_filename": "llm_renames_audit.jsonl",
+    "checkpoint_filename": "llm_renames_checkpoint.json"
+  }
+}
