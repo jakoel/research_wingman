@@ -1,25 +1,25 @@
 # llm_renamer
 
 Renames auto-generated IDA Pro function names (`sub_*`, `j_*`, `nullsub_*`, …) using a locally-running LLM.  
-Works by querying a live IDA database through **idasql** over HTTP — no IDAPython, no IDA plugin installation required.
+Opens the `.i64` database directly via **idapro** — no idasql server, no IDA plugin required.
 
 ---
 
 ## How it works
 
 ```
-IDA Pro (headless)
-  └── idasql --http 8081          ← serves SQL queries against the .i64 database
-        │
-        │  POST /query  (SQL)
-        ▼
-  llm_renamer (this tool)
-    1. SELECT all sub_* / j_* / nullsub_* functions
-    2. For each: SELECT pseudocode, strings, imports, callers, callees
-    3. Send context to Ollama → receive JSON rename suggestion
-    4. Validate suggestion (confidence, risk, name rules)
-    5. Review mode  → write proposals to JSON file, no DB changes
-       Apply mode   → UPDATE funcs SET name = '...' WHERE address = ea
+idapro.open_database("target.i64")
+  │
+  │  IDA Python API (idautils, idc, ida_hexrays)
+  ▼
+llm_renamer (this tool)
+  1. Enumerate sub_* / j_* / nullsub_* functions
+  2. For each: extract pseudocode, strings, imports, callers, callees
+  3. Send context to Ollama → receive JSON rename suggestion
+  4. Validate suggestion (confidence, risk, name rules)
+  5. Review mode  → write proposals to JSON file, no DB changes
+     Apply mode   → idc.set_name(ea, new_name) into the open database
+                    (changes are saved when the database closes)
 ```
 
 ---
@@ -28,25 +28,14 @@ IDA Pro (headless)
 
 | Requirement | Notes |
 |---|---|
-| **IDA Pro 9+** | Required. idasql is built against IDA SDK 9.0+. |
+| **IDA Pro 9+** with **idapro** | `idapro` is IDA's headless Python package. Installed alongside IDA Pro. |
 | **Hex-Rays decompiler** | Required for pseudocode. Part of IDA Pro (separate license). |
-| **idasql** | Exposes the IDA database as a SQL HTTP server. See below. |
-| **Ollama** | Local LLM server. `ollama.com` |
-| **Python 3.9+** | Standard library only — no pip install needed. Runs outside IDA using your system Python, not IDA's bundled Python. |
+| **Ollama** | Local LLM server. `ollama.com`. Can run on the same or a remote machine. |
+| **Python 3.9+** | Run from IDA's bundled Python or any Python environment where `idapro` is importable. |
 
 ---
 
-## 1. Install idasql
-
-idasql exposes IDA Pro's internal database as 30+ live SQL virtual tables, including a `pseudocode` table backed by Hex-Rays.
-
-**Repository:** https://github.com/allthingsida/idasql
-
-Follow the build instructions in the idasql README for your platform. Once built, the binary is a standalone executable.
-
----
-
-## 2. Install Ollama and pull a model
+## 1. Install Ollama and pull a model
 
 ```bash
 # Install Ollama: https://ollama.com
@@ -54,20 +43,16 @@ ollama pull codellama:13b-instruct
 ```
 
 Any instruction-following model works. Larger code models give better rename quality.  
-Update `llm_renamer/config.json` if you use a different model name.
+If Ollama runs on a different machine, pass `--ollama-url http://<host>:11434` at runtime.
 
 ---
 
-## 3. Configure
+## 2. Configure
 
 Edit **`llm_renamer/config.json`**:
 
 ```json
 {
-  "idasql": {
-    "url": "http://localhost:8081",
-    "timeout_seconds": 30
-  },
   "ollama": {
     "url": "http://localhost:11434",
     "model": "codellama:13b-instruct",
@@ -84,7 +69,7 @@ Key settings:
 
 | Key | Default | Description |
 |---|---|---|
-| `idasql.url` | `http://localhost:8081` | idasql HTTP server address |
+| `ollama.url` | `http://localhost:11434` | Ollama server address (can be a remote host) |
 | `ollama.model` | `codellama:13b-instruct` | Ollama model name |
 | `analysis.confidence_threshold` | `0.65` | Minimum LLM confidence to accept a rename |
 | `analysis.skip_high_risk` | `true` | Reject suggestions the LLM marks as high-risk |
@@ -93,40 +78,52 @@ Key settings:
 
 ---
 
-## 4. Run
-
-### Step 1 — Start idasql against your database
-
-```bash
-idasql -s /path/to/target.i64 --http 8081
-```
-
-This starts a headless IDA session and exposes it as an HTTP server.  
-Hex-Rays is loaded automatically if your IDA installation includes it.  
-Leave this running while llm_renamer executes.
-
-### Step 2 — Run llm_renamer
+## 3. Run
 
 **Review mode** *(default — no database changes)*
 
 ```bash
-python main.py
+python main.py --database /path/to/target.i64
 ```
 
-Queries every `sub_*` / `j_*` / `nullsub_*` function, sends context to Ollama, and writes a review file. The IDA database is not modified.
+Analyzes every `sub_*` / `j_*` / `nullsub_*` function, sends context to Ollama, and writes a review file. The database is not modified.
 
-**Apply mode** *(writes renames into IDA via idasql)*
+**Apply mode** *(writes renames into the .i64)*
 
 ```bash
-python main.py --apply
+python main.py --database target.i64 --apply
 ```
 
-Same as review mode but also issues `UPDATE funcs SET name = '...'` for every approved suggestion. Prompts for confirmation before starting.
+Same as review mode but also calls `idc.set_name()` for every approved suggestion. The `.i64` is updated when the database closes. Prompts for confirmation before starting.
+
+**Process only a batch** *(useful for large binaries)*
+
+```bash
+python main.py --database target.i64 --limit 200
+```
+
+Stops after 200 LLM calls. The checkpoint is saved automatically; the next run picks up where this one left off.
+
+**Target a specific function**
+
+```bash
+python main.py --database target.i64 --function sub_1c0012232
+python main.py --database target.i64 --function sub_1c0012232 --apply
+python main.py --database target.i64 --function 0x1c0012232 sub_401000
+```
+
+Analyzes only the named function(s), bypassing the checkpoint and the auto-generated prefix filter. Accepts names or hex addresses. Combine with `--apply` to rename immediately.
+
+**Ollama on a remote host**
+
+```bash
+python main.py --database target.i64 --ollama-url http://192.168.1.50:11434
+```
 
 **Apply from a previous review file** *(no LLM calls)*
 
 ```bash
-python main.py --apply-file llm_renames_review.json
+python main.py --database target.i64 --apply-file llm_renames_review.json
 ```
 
 Reads an existing review JSON and applies only the approved renames. Useful for reviewing proposals in an editor before committing them.
@@ -134,7 +131,7 @@ Reads an existing review JSON and applies only the approved renames. Useful for 
 **Reset progress**
 
 ```bash
-python main.py --clear-checkpoint
+python main.py --database target.i64 --clear-checkpoint
 ```
 
 Deletes the checkpoint so all functions are reprocessed on the next run.
@@ -142,24 +139,41 @@ Deletes the checkpoint so all functions are reprocessed on the next run.
 ### All CLI options
 
 ```
-python main.py [options]
+python main.py --database PATH [options]
 
-  --config PATH        Path to config.json  (default: llm_renamer/config.json)
-  --idasql-url URL     Override idasql server URL
-  --ollama-url URL     Override Ollama server URL
-  --model NAME         Override Ollama model name
-  --out-dir DIR        Output directory (default: current working directory)
-  --apply              Analyze and apply approved renames
-  --apply-file PATH    Apply from an existing review JSON (no LLM calls)
-  --clear-checkpoint   Reset checkpoint and exit
-  --no-resume          Ignore checkpoint; reprocess all functions
+Required:
+  --database PATH        Path to the .i64 IDA database file
+
+Configuration:
+  --config PATH          Path to config.json  (default: llm_renamer/config.json)
+  --ollama-url URL       Override Ollama server URL (e.g. http://remote-host:11434)
+  --model NAME           Override Ollama model name
+  --out-dir DIR          Output directory (default: current working directory)
+
+Function selection:
+  --function NAME ...    Analyze only these function(s) by name or hex address
+  --limit N              Stop after N LLM calls; checkpoint saves progress
+
+Run modes:
+  (none)                 Review mode — analyze and write review JSON, no renames
+  --apply                Analyze and apply approved renames
+  --apply-file PATH      Apply from an existing review JSON (no LLM calls)
+
+Pipeline control:
+  --rebuild-graph        Discard call_graph.json cache and rebuild
+  --skip-refine          Skip Phase 4 top-down refinement pass
+  --build-index          Build FAISS vector index after analysis (Phase 5)
+
+Checkpoint:
+  --clear-checkpoint     Reset checkpoint and exit
+  --no-resume            Ignore checkpoint; reprocess all functions
 ```
 
 ---
 
 ## Output files
 
-All three files are written to the current directory (or `--out-dir`).
+All files are written to the current directory (or `--out-dir`).
 
 ### `llm_renames_review.json`
 
@@ -196,7 +210,7 @@ Machine-readable list of every proposal. Human-reviewable before applying.
 
 ### `llm_renames_audit.jsonl`
 
-Append-only JSON Lines log. One record per processed function, including every function that was skipped, rejected, or failed.
+Append-only JSON Lines log. One record per processed function, including skips, rejections, and failures.
 
 ```jsonl
 {"ts":"2026-05-09T12:00:01Z","address":"0x401A30","old_name":"sub_401A30","suggested_name":"decrypt_aes_block","final_name":"decrypt_aes_block","confidence":0.87,"risk":"low","reason":"...","applied":true,"rejection_reason":"","error":""}
@@ -205,13 +219,13 @@ Append-only JSON Lines log. One record per processed function, including every f
 
 ### `llm_renames_checkpoint.json`
 
-Stores the set of already-processed function addresses. Enables safe interruption and resumption — rerun the same command after a crash or `Ctrl-C` and it picks up where it left off.
+Set of already-processed addresses. Enables safe interruption and resumption — rerun the same command and it picks up where it left off.
 
 ---
 
 ## Rename policy
 
-- **Only auto-generated names** are eligible (`sub_*`, `j_*`, `nullsub_*`, `locret_*`, `loc_*`)
+- **Only auto-generated names** are eligible by default (`sub_*`, `j_*`, `nullsub_*`, `locret_*`, `loc_*`). Use `--function` to target any function regardless of name.
 - **Analyst-created names are never overwritten** (`never_overwrite_analyst_names: true`)
 - **Rejected automatically if**: confidence below threshold · risk is `high` · name is vague · name contains illegal characters · name starts with a digit · name is longer than 64 characters
 - **Conflict resolution**: if the suggested name already exists, appends `_2`, `_3`, … up to suffix limit
@@ -224,57 +238,50 @@ Stores the set of already-processed function addresses. Enables safe interruptio
 llm_renamer/
   config.json          User-editable configuration
   config.py            Config loader with defaults and deep-merge
-  idasql_client.py     HTTP client + SQL-based context extraction
-  llm_client.py        Ollama HTTP client (stdlib urllib, no dependencies)
+  idapro_client.py     IDA Python API context extraction (pseudocode, xrefs, strings, imports)
+  call_graph.py        Phase 1: call graph construction and caching
+  scorer.py            Phase 2: function scoring and bottom-up worklist ordering
+  llm_client.py        Ollama HTTP client (stdlib urllib, no extra dependencies)
   validator.py         LLM output validation and snake_case sanitization
-  renamer.py           Safe rename policy and UPDATE execution
+  renamer.py           Safe rename policy (idc.set_name wrapper)
+  prompts.py           System prompt and per-function user prompt builder
+  kb.py                SQLite knowledge base (Phases 3/4/5)
+  embedder.py          Phase 5: FAISS vector index via Ollama embeddings
+  refiner.py           Phase 4: top-down refinement pass
   audit.py             Append-only JSON Lines audit logger
   checkpoint.py        Atomic-replace checkpoint for resumable runs
   review.py            Review JSON writer and reader
-  prompts.py           System prompt and per-function user prompt builder
 
-main.py                CLI entry point
+main.py                CLI entry point (Phases 1–5)
+query.py               Phase 6 query CLI
 README.md              This file
+ARCHITECTURE.md        Full design reference
 ```
-
----
-
-## idasql table reference (used by this tool)
-
-| Table | Columns used | Purpose |
-|---|---|---|
-| `funcs` | `address`, `name`, `size`, `end_ea` | Enumerate functions, apply renames |
-| `pseudocode` | `func_addr`, `line`, `line_num` | Hex-Rays pseudocode, one row per line (requires Hex-Rays license) |
-| `decompile(ea)` | scalar function | Returns full pseudocode as a single string — primary method used by this tool |
-| `strings` | `address`, `content` | String literals referenced by a function |
-| `imports` | `address`, `name`, `module` | Imported API names |
-| `xrefs` | `from_ea`, `to_ea`, `is_code` | Call relationships |
-| `instructions` | `address`, `func_addr` | Maps instruction address → parent function |
-| `blocks` | `func_ea` | Basic block count (complexity metric) |
-| `names` | `address`, `name` | Global name table for conflict detection |
-| `comments` | `address`, (text columns) | Analyst comments attached to a function |
-
----
-
-## Planned
-
-- **Call chain generation**: forward traversal from all entry points (`main`, `WinMain`, `DllMain`, TLS callbacks), output as Markdown with indented call tree and flat path-per-line list. Intended to feed document ranking against CVE text corpora.
 
 ---
 
 ## Troubleshooting
 
-**`idasql is not reachable`**  
-Make sure `idasql -s your_binary.i64 --http 8081` is running and the port matches `idasql.url` in config.
+**`database not found`**  
+Check the path passed to `--database`. The file must exist and be a valid `.i64`.
 
 **`Ollama is not reachable`**  
-Run `ollama run codellama:13b-instruct` to start the server and verify the model is pulled.
+Run `ollama run codellama:13b-instruct` to start the server. If Ollama is on another machine, pass `--ollama-url http://<host>:11434` and ensure the port is reachable from the VM.
 
 **`No Hex-Rays pseudocode available`** (logged for many functions)  
-Your IDA installation does not include the Hex-Rays decompiler, or the binary architecture is not supported by your Hex-Rays version. Functions without pseudocode are skipped and logged.
+Your IDA installation does not include the Hex-Rays decompiler, or the binary architecture is not supported. Functions without pseudocode are skipped and logged.
+
+**`not found in database: 'sub_...'`** (when using `--function`)  
+The name was not found via `idc.get_name_ea_simple`. Double-check the exact spelling. You can also pass the hex address directly: `--function 0x1c0012232`.
 
 **Interrupted run**  
-Just rerun the same command. The checkpoint file ensures already-processed functions are skipped.
+Just rerun the same command. The checkpoint ensures already-processed functions are skipped.
 
 **Want to reprocess everything**  
-Run `python main.py --clear-checkpoint` then rerun.
+Run `python main.py --database target.i64 --clear-checkpoint` then rerun.
+
+---
+
+## Planned
+
+- **Call chain generation**: forward traversal from all entry points (`main`, `WinMain`, `DllMain`, TLS callbacks), output as Markdown with indented call tree. Intended to feed document ranking against CVE text corpora.

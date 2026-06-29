@@ -1,8 +1,4 @@
 {
-  "idasql": {
-    "url": "http://localhost:8081",
-    "timeout_seconds": 30
-  },
   "ollama": {
     "url": "http://localhost:11434",
     "model": "codellama:13b-instruct",
@@ -51,7 +47,6 @@
     }
   },
   "graph": {
-    "timeout_seconds": 300,
     "cache_filename": "call_graph.json",
     "dangerous_sinks": [
       "memcpy", "memmove", "strcpy", "strcat", "sprintf", "vsprintf",

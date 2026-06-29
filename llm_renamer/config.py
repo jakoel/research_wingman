@@ -5,10 +5,6 @@ import json
 import copy
 
 _DEFAULTS = {
-    "idasql": {
-        "url": "http://localhost:8081",
-        "timeout_seconds": 30,
-    },
     "ollama": {
         "url": "http://localhost:11434",
         "model": "codellama:13b-instruct",

@@ -3,38 +3,40 @@
 llm_renamer — standalone CLI
 
 Renames auto-generated IDA Pro functions (sub_*, j_*, nullsub_*, …) using a
-local Ollama LLM, by talking to a running idasql HTTP server.
+local Ollama LLM, by opening the IDA database directly via idapro.
 
 Workflow
 --------
-1. Start idasql against your database:
-       idasql -s target.i64 --http 8081
+1. Run in review mode (no DB changes):
+       python main.py --database target.i64
 
-2. Run in review mode (no DB changes):
-       python main.py --config llm_renamer/config.json
+2. Inspect the review JSON, then apply:
+       python main.py --database target.i64 --apply
 
-3. Inspect the review JSON, then apply:
-       python main.py --config llm_renamer/config.json --apply
+3. Process only a batch of N functions (checkpoint resumes next run):
+       python main.py --database target.i64 --limit 200
 
-4. Or apply from a previous review file:
-       python main.py --apply-file llm_renames_review.json
+4. Apply from a previous review file:
+       python main.py --database target.i64 --apply-file llm_renames_review.json
 
 5. After analysis, build the semantic vector index:
-       python main.py --build-index
+       python main.py --database target.i64 --build-index
 
 6. Query the knowledge base:
        python query.py "user-controlled length without bounds check"
 
 Options
 -------
+  --database PATH        Path to the .i64 IDA database  (required)
   --config PATH          Path to config.json  (default: llm_renamer/config.json)
-  --idasql-url URL       Override idasql server URL
   --ollama-url URL       Override Ollama server URL
   --model NAME           Override Ollama model name
   --out-dir DIR          Directory for output files (default: cwd)
-  --apply                Analyze AND apply approved renames
+  --limit N              Stop after analyzing N functions (checkpoint saves progress)
+  --function NAME ...    Analyze only the named function(s); accepts names or 0x addresses
+  --apply                Analyze AND apply approved renames into the database
   --apply-file PATH      Apply renames from an existing review JSON (no LLM)
-  --rebuild-graph        Discard cached call graph and rebuild from idasql
+  --rebuild-graph        Discard cached call graph and rebuild
   --skip-refine          Skip Phase 4 top-down refinement pass
   --build-index          Build FAISS vector index after analysis (Phase 5)
   --clear-checkpoint     Reset checkpoint so all functions are reprocessed
@@ -51,7 +53,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from llm_renamer.config import load_config
-from llm_renamer.idasql_client import IdaSQLClient, FunctionContextExtractor, IdaSQLError
+from llm_renamer.idapro_client import FunctionContextExtractor
 from llm_renamer.llm_client import OllamaClient, LLMError
 from llm_renamer.validator import validate_llm_output, is_auto_generated_name
 from llm_renamer.renamer import RenamePolicy
@@ -75,12 +77,12 @@ def _build_paths(config: dict, out_dir: str) -> dict:
     kb_name    = config.get("kb",    {}).get("sqlite_filename", "knowledge_base.sqlite")
     faiss_name = config.get("kb",    {}).get("faiss_filename",  "kb_vectors.faiss")
     return {
-        "review":     os.path.join(out_dir, config["output"]["review_filename"]),
-        "audit":      os.path.join(out_dir, config["output"]["audit_filename"]),
-        "checkpoint": os.path.join(out_dir, config["output"]["checkpoint_filename"]),
-        "call_graph": os.path.join(out_dir, graph_name),
+        "review":         os.path.join(out_dir, config["output"]["review_filename"]),
+        "audit":          os.path.join(out_dir, config["output"]["audit_filename"]),
+        "checkpoint":     os.path.join(out_dir, config["output"]["checkpoint_filename"]),
+        "call_graph":     os.path.join(out_dir, graph_name),
         "knowledge_base": os.path.join(out_dir, kb_name),
-        "faiss":      os.path.join(out_dir, faiss_name),
+        "faiss":          os.path.join(out_dir, faiss_name),
     }
 
 
@@ -92,26 +94,36 @@ def run_analysis(
     config: dict,
     paths: dict,
     apply_mode: bool,
+    extractor: FunctionContextExtractor,
     use_checkpoint: bool = True,
     graph: CallGraph | None = None,
     kb: KnowledgeBase | None = None,
     scores: dict | None = None,
+    limit: int | None = None,
+    target_functions: list[str] | None = None,
 ) -> None:
-    db        = IdaSQLClient(config)
-    extractor = FunctionContextExtractor(db, config)
-    llm       = OllamaClient(config)
-    policy    = RenamePolicy(config, db, extractor)
-    reviewer  = ReviewWriter(paths["review"])
-    checkpoint = Checkpoint(paths["checkpoint"]) if use_checkpoint else _NullCheckpoint()
+    llm      = OllamaClient(config)
+    policy   = RenamePolicy(config, extractor)
+    reviewer = ReviewWriter(paths["review"])
+
+    # Targeted mode bypasses checkpoint — the user explicitly asked for these.
+    targeted = bool(target_functions)
+    checkpoint = (
+        _NullCheckpoint() if (not use_checkpoint or targeted)
+        else Checkpoint(paths["checkpoint"])
+    )
 
     mode_label = "Apply" if apply_mode else "Review"
 
-    print("[llm_renamer] Fetching auto-generated functions from idasql…")
-    try:
+    if targeted:
+        print(f"[llm_renamer] Targeted mode — looking up {len(target_functions)} function(s)…")
+        raw_funcs = extractor.get_functions_by_name(target_functions)
+        if not raw_funcs:
+            print("[llm_renamer] No matching functions found.")
+            return
+    else:
+        print("[llm_renamer] Fetching auto-generated functions…")
         raw_funcs = extractor.get_all_auto_functions()
-    except IdaSQLError as e:
-        print(f"[llm_renamer] ERROR: Could not query idasql: {e}")
-        sys.exit(1)
 
     # ---- Phase 2: build scored, bottom-up ordered worklist ----------------
     if graph is not None and raw_funcs:
@@ -120,8 +132,6 @@ def run_analysis(
         ordered_addrs = [
             a for a in build_worklist(graph, config) if a in auto_addr_set
         ]
-        # Append any functions the graph doesn't know about (shouldn't happen
-        # but guards against partial graphs)
         ordered_addrs += [a for a in auto_addr_set if a not in set(ordered_addrs)]
         funcs = [func_map[a] for a in ordered_addrs]
         print(f"[llm_renamer] Worklist built: {len(funcs)} functions in scored order")
@@ -133,11 +143,14 @@ def run_analysis(
     processed = 0
     applied   = 0
     errors    = 0
+    llm_calls_this_run = 0
 
     print(
         f"[llm_renamer] {mode_label} mode — "
         f"{total} auto-generated functions ({skipped} already checkpointed)"
     )
+    if limit is not None:
+        print(f"[llm_renamer] --limit {limit}: will stop after {limit} LLM calls this run")
 
     with AuditLogger(paths["audit"]) as audit:
         for func_row in funcs:
@@ -198,7 +211,15 @@ def run_analysis(
                 processed += 1
                 continue
 
-            # ---- inject callee summaries from KB (Phase 3 context) --------
+            # ---- enforce per-run limit ------------------------------------
+            if limit is not None and llm_calls_this_run >= limit:
+                print(
+                    f"\n[llm_renamer] --limit {limit} reached. "
+                    "Checkpoint saved; run again to continue."
+                )
+                break
+
+            # ---- inject callee summaries from KB --------------------------
             callee_entries: list[dict] = []
             if kb is not None and graph is not None:
                 callee_addrs = graph.callees_of(ea)
@@ -208,11 +229,11 @@ def run_analysis(
             try:
                 user_prompt  = build_user_prompt(ctx, callee_kb_entries=callee_entries)
                 raw_response = llm.analyze(SYSTEM_PROMPT, user_prompt)
+                llm_calls_this_run += 1
             except LLMError as e:
                 errors += 1
                 reviewer.increment_errors()
                 audit.record_error(address=addr_hex, name=name, error=str(e))
-                # Not checkpointed — will retry on next run
                 processed += 1
                 continue
 
@@ -225,7 +246,7 @@ def run_analysis(
             evidence   = raw_response.get("evidence", {})
             raw_name   = str(raw_response.get("suggested_name", "")).strip()
 
-            # ---- write to knowledge base (always after successful LLM call)
+            # ---- write to knowledge base ----------------------------------
             if kb is not None:
                 node = graph.nodes.get(ea) if graph else None
                 kb.upsert({
@@ -245,7 +266,6 @@ def run_analysis(
                     "phase3_done":  True,
                     "phase4_refined": False,
                 })
-                # Persist call edges for Phase 6 chain queries
                 if graph is not None:
                     for callee_addr in graph.callees_of(ea):
                         kb.upsert_edge(addr_hex, f"0x{callee_addr:X}")
@@ -319,22 +339,25 @@ def run_analysis(
 # Apply-from-file  (no LLM)
 # ==========================================================================
 
-def run_apply_from_file(config: dict, paths: dict, review_path: str) -> None:
+def run_apply_from_file(
+    config: dict,
+    paths: dict,
+    review_path: str,
+    extractor: FunctionContextExtractor,
+) -> None:
     try:
         proposals = ReviewWriter.load_proposals(review_path)
     except (json.JSONDecodeError, IOError) as e:
         print(f"[llm_renamer] ERROR: Cannot load review file: {e}")
         sys.exit(1)
 
-    db        = IdaSQLClient(config)
-    extractor = FunctionContextExtractor(db, config)
-    policy    = RenamePolicy(config, db, extractor)
+    policy    = RenamePolicy(config, extractor)
     threshold = float(config["analysis"]["confidence_threshold"])
     skip_high = config["analysis"].get("skip_high_risk", True)
 
-    applied  = 0
-    skipped  = 0
-    errors   = 0
+    applied = 0
+    skipped = 0
+    errors  = 0
 
     with AuditLogger(paths["audit"]) as audit:
         for prop in proposals:
@@ -364,13 +387,8 @@ def run_apply_from_file(config: dict, paths: dict, review_path: str) -> None:
                 )
                 continue
 
-            try:
-                rows = db.query(
-                    f"SELECT name FROM funcs WHERE address = {ea} LIMIT 1"
-                )
-                current_name = rows[0].get("name", "") if rows else prop.get("current_name", "")
-            except IdaSQLError:
-                current_name = prop.get("current_name", "")
+            import idc
+            current_name = idc.get_func_name(ea) or prop.get("current_name", "")
 
             allowed, reason = policy.can_rename(current_name)
             if not allowed:
@@ -474,30 +492,38 @@ def _print_summary(mode, processed, total, reviewer, applied, errors, paths):
 
 def _parse_args():
     p = argparse.ArgumentParser(
-        description="Rename IDA auto-generated functions using a local LLM via idasql",
+        description="Rename IDA auto-generated functions using a local LLM via idapro",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
+    )
+    p.add_argument(
+        "--database", metavar="PATH", required=True,
+        help="Path to the .i64 IDA database file",
     )
     p.add_argument(
         "--config",
         default=os.path.join(os.path.dirname(__file__), "llm_renamer", "config.json"),
         metavar="PATH",
     )
-    p.add_argument("--idasql-url", metavar="URL")
-    p.add_argument("--ollama-url",  metavar="URL")
-    p.add_argument("--model",       metavar="NAME")
-    p.add_argument("--out-dir",     metavar="DIR")
+    p.add_argument("--ollama-url", metavar="URL")
+    p.add_argument("--model",      metavar="NAME")
+    p.add_argument("--out-dir",    metavar="DIR")
+    p.add_argument(
+        "--limit", metavar="N", type=int, default=None,
+        help="Stop after N LLM calls; checkpoint saves progress for the next run",
+    )
+    p.add_argument(
+        "--function", metavar="NAME", nargs="+", default=None,
+        help="Analyze only these function(s) by name or hex address; bypasses checkpoint",
+    )
 
     mode = p.add_mutually_exclusive_group()
     mode.add_argument("--apply",      action="store_true")
     mode.add_argument("--apply-file", metavar="PATH")
 
-    p.add_argument("--rebuild-graph",    action="store_true",
-                   help="Discard cached call graph and rebuild from idasql")
-    p.add_argument("--skip-refine",      action="store_true",
-                   help="Skip Phase 4 top-down refinement")
-    p.add_argument("--build-index",      action="store_true",
-                   help="Build FAISS vector index after analysis (requires faiss-cpu)")
+    p.add_argument("--rebuild-graph",    action="store_true")
+    p.add_argument("--skip-refine",      action="store_true")
+    p.add_argument("--build-index",      action="store_true")
     p.add_argument("--clear-checkpoint", action="store_true")
     p.add_argument("--no-resume",        action="store_true")
     return p.parse_args()
@@ -506,11 +532,15 @@ def _parse_args():
 def main():
     args = _parse_args()
 
+    # ---- validate database path ------------------------------------------
+    db_path = os.path.abspath(args.database)
+    if not os.path.exists(db_path):
+        print(f"[llm_renamer] ERROR: database not found: {db_path}")
+        sys.exit(1)
+
     config_dir = os.path.dirname(os.path.abspath(args.config))
     config = load_config(config_dir)
 
-    if args.idasql_url:
-        config["idasql"]["url"] = args.idasql_url
     if args.ollama_url:
         config["ollama"]["url"] = args.ollama_url
     if args.model:
@@ -519,7 +549,7 @@ def main():
     out_dir = args.out_dir or config["output"].get("dir") or os.getcwd()
     paths   = _build_paths(config, out_dir)
 
-    # --clear-checkpoint
+    # --clear-checkpoint (no IDA needed)
     if args.clear_checkpoint:
         cp = Checkpoint(paths["checkpoint"])
         n  = cp.count()
@@ -527,26 +557,40 @@ def main():
         print(f"[llm_renamer] Checkpoint cleared ({n} addresses removed).")
         return
 
-    # --apply-file: idasql needed but no LLM or graph required
-    if args.apply_file:
-        print(f"[llm_renamer] Apply-from-file: {args.apply_file}")
-        _check_idasql(config)
-        run_apply_from_file(config, paths, args.apply_file)
-        return
+    # ---- open IDA database -----------------------------------------------
+    import idapro
+    print(f"[llm_renamer] Opening database: {db_path}")
+    idapro.open_database(db_path, run_auto_analysis=False)
 
-    _check_idasql(config)
+    try:
+        _run(args, config, paths, db_path)
+    finally:
+        print("[llm_renamer] Closing database…")
+        idapro.close_database()
+
+
+def _run(args, config, paths, db_path):
+    """All work that requires the IDA database to be open."""
+    extractor = FunctionContextExtractor(config)
+
     _check_ollama(config)
 
     if args.apply:
-        print("[llm_renamer] WARNING: apply mode will write renames into the idasql database.")
+        print("[llm_renamer] WARNING: apply mode will write renames into the database.")
         answer = input("Proceed? [y/N] ").strip().lower()
         if answer != "y":
             print("Aborted.")
             return
 
+    # --apply-file: no LLM or graph required
+    if args.apply_file:
+        print(f"[llm_renamer] Apply-from-file: {args.apply_file}")
+        run_apply_from_file(config, paths, args.apply_file, extractor)
+        return
+
     # ---- Phase 1: build / load call graph --------------------------------
     graph = load_or_build(
-        IdaSQLClient(config), config,
+        extractor, config,
         paths["call_graph"],
         force_rebuild=args.rebuild_graph,
     )
@@ -565,10 +609,13 @@ def main():
         config=config,
         paths=paths,
         apply_mode=args.apply,
+        extractor=extractor,
         use_checkpoint=not args.no_resume,
         graph=graph,
         kb=kb,
         scores=scores,
+        limit=args.limit,
+        target_functions=args.function,
     )
 
     # ---- Phase 4: top-down refinement ------------------------------------
@@ -611,18 +658,6 @@ def _build_faiss_index(config: dict, paths: dict, kb: KnowledgeBase) -> None:
         embedder.build_index(entries)
     except EmbedderUnavailable as e:
         print(f"[llm_renamer] Embedder unavailable: {e}")
-
-
-def _check_idasql(config):
-    db = IdaSQLClient(config)
-    if not db.health_check():
-        url = config["idasql"]["url"]
-        print(
-            f"[llm_renamer] ERROR: idasql is not reachable at {url}\n"
-            f"  Start it with:  idasql -s your_binary.i64 --http 8081"
-        )
-        sys.exit(1)
-    print(f"[llm_renamer] idasql OK at {config['idasql']['url']}")
 
 
 def _check_ollama(config):

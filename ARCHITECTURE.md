@@ -25,8 +25,9 @@ This is encoded directly in the scoring formula (§4).
 ## 2. System Overview
 
 ```
-idasql server  (idasql -s target.i64 --http 8081)
+idapro.open_database("target.i64", run_auto_analysis=False)
       │
+      │  IDA Python API (idautils, idc, ida_funcs, ida_hexrays, ida_gdl, ida_nalt)
       ▼
 ┌──────────────┐
 │  Phase 1     │  call_graph.py          Build annotated call graph
@@ -62,10 +63,13 @@ idasql server  (idasql -s target.i64 --http 8081)
 │  Phase 6     │  query.py               Researcher queries
 │  Query       │  (reads KB + FAISS)     Semantic search / call chains
 └──────────────┘
+
+idapro.close_database()   ← renames (idc.set_name) are flushed here
 ```
 
 **Dependencies between phases:**
-- Phase 2 reads the Phase 1 cache. It does not query idasql.
+- Phase 1 uses IDA Python API directly. Result cached to `call_graph.json`.
+- Phase 2 reads the Phase 1 cache. Does not call IDA API.
 - Phase 3 reads KB entries written by earlier Phase 3 iterations (callee summary injection).
 - Phase 4 reads Phase 3 KB entries and writes back to the same rows.
 - Phase 5 reads Phase 3/4 KB entries. Can run independently after Phase 3.
@@ -87,11 +91,13 @@ research-helper/
     ├── config.json        User-editable defaults (all tunable parameters)
     ├── config.py          Config loader with deep-merge over defaults
     │
-    │   ── idasql layer ──────────────────────────────────────────────
-    ├── idasql_client.py   HTTP client + response parser + FunctionContextExtractor
+    │   ── IDA layer ──────────────────────────────────────────────────
+    ├── idapro_client.py   IDA Python API client + FunctionContextExtractor
+    │                      Caches import map and string map for sharing with Phase 1
     │
     │   ── graph layer ───────────────────────────────────────────────
     ├── call_graph.py      Phase 1: CallNode, CallGraph, CallGraphBuilder, load_or_build
+    │                      Single-pass over all instructions (edges + imports + strings)
     │
     │   ── scoring ────────────────────────────────────────────────────
     ├── scorer.py          Phase 2: score_node, depth_from_leaves, build_worklist
@@ -109,7 +115,7 @@ research-helper/
     ├── refiner.py         Phase 4: top-down refinement pass
     │
     │   ── rename application ────────────────────────────────────────
-    ├── renamer.py         Rename policy + idasql UPDATE
+    ├── renamer.py         Rename policy + idc.set_name wrapper
     │
     │   ── persistence ────────────────────────────────────────────────
     ├── audit.py           Append-only JSONL audit log
@@ -200,49 +206,43 @@ class CallGraph:
 
 ### 5.2 Build sequence (`CallGraphBuilder.build`)
 
-1. `SELECT address, name, size, end_ea FROM funcs` → all function nodes
-2. `_fetch_edges()` → all internal call edges (see §5.3)
+1. `idautils.Functions()` → enumerate all function entry addresses
+2. `_single_pass()` → **one pass over all instructions** via `idautils.FuncItems` + `idautils.XrefsFrom`:
+   - Internal call edges: code xrefs to addresses in `func_addrs`
+   - Import refs: code xrefs to addresses in the import map
+   - Dangerous-sink calls: import refs whose name is in `dangerous_sinks`
+   - String refs: data xrefs to addresses in the string cache
 3. `_annotate_caller_counts` — increment `caller_count` from edges
 4. `_annotate_callee_lists` — populate `callee_addresses` from edges
-5. `_annotate_dangerous_sinks` — query imports JOIN xrefs JOIN instructions
-6. `_annotate_import_refs` — all imports called by each function
-7. `_annotate_string_refs` — all string literals xref'd by each function
-8. `_annotate_basic_blocks` — `SELECT func_ea, COUNT(*) FROM blocks GROUP BY func_ea`
-9. `_annotate_input_reachable` — BFS forward from input-API seed functions
+5. `_annotate_basic_blocks` — `ida_gdl.FlowChart(func)` per function
+6. `_annotate_input_reachable` — BFS forward from input-API seed functions
 
-### 5.3 Edge extraction strategy
+### 5.3 Single-pass annotation
 
-Primary (uses `instructions` table — fast, indexed):
-```sql
-SELECT DISTINCT i.func_addr AS caller, x.to_ea AS callee
-FROM xrefs x
-JOIN instructions i ON i.address = x.from_ea
-JOIN funcs f ON f.address = x.to_ea
-WHERE x.is_code = 1 AND i.func_addr IS NOT NULL AND i.func_addr != x.to_ea
-```
+The builder shares the `FunctionContextExtractor`'s import cache and string cache.
+Both caches are built lazily on first use and reused across Phase 1 (graph build)
+and Phase 3 (context extraction), so they are never constructed twice.
 
-Fallback (range join — used if `instructions` table is unavailable):
-```sql
-SELECT DISTINCT f1.address AS caller, f2.address AS callee
-FROM funcs f1
-JOIN xrefs x ON x.from_ea >= f1.address AND x.from_ea < f1.end_ea
-JOIN funcs f2 ON f2.address = x.to_ea
-WHERE x.is_code = 1 AND f1.address != f2.address
-```
+**Import detection:** a code xref from an instruction to an address that appears
+in the import map is counted as an import call. Import map is built via
+`ida_nalt.get_import_module_qty()` / `ida_nalt.enum_import_names()`.
 
-The graph builder uses a **separate idasql client** with `graph.timeout_seconds`
-(default 300 s) because aggregate queries over large binaries can exceed the
-standard 30 s idasql timeout.
+**String detection:** the string map is built from `idautils.Strings()`. Any data
+xref from an instruction to an address in the string map is a string reference.
+
+**Edge detection:** a code xref from an instruction to any address in `func_addrs`
+(the set of all function start addresses) is counted as an internal call edge.
+This correctly handles direct calls and tail calls; indirect calls through
+import stubs are excluded because import addresses are not in `func_addrs`.
 
 ### 5.4 `input_reachable` — definition and BFS direction
 
-Seed functions = functions that directly call a known input-ingestion API
+Seed functions = functions whose `import_refs` contain any name from `input_sink_apis`
 (`recv`, `read`, `fgets`, `fread`, `WSARecv`, `ReadFile`, `getchar`, `scanf`, `fscanf`).
 
 BFS direction: **forward (callee direction)** from seeds. A function is marked
 `input_reachable=true` if it is reachable by following call edges starting from
-a seed. This marks all functions in the input-processing call tree — the functions
-most likely to handle user-controlled data.
+a seed. This marks all functions in the input-processing call tree.
 
 Overapproximation (false positives) is acceptable. This is a scoring signal, not
 a security verdict.
@@ -250,8 +250,8 @@ a security verdict.
 ### 5.5 Cache
 
 The graph is serialised to JSON via `graph.save(path)` (atomic `.tmp` swap).
-`load_or_build(db, config, cache_path, force_rebuild=False)` loads from cache
-if present; rebuilds and re-saves if not. Pass `force_rebuild=True` (or
+`load_or_build(extractor, config, cache_path, force_rebuild=False)` loads from
+cache if present; rebuilds and re-saves if not. Pass `force_rebuild=True` (or
 `--rebuild-graph` CLI flag) to discard the cache.
 
 JSON format:
@@ -267,25 +267,86 @@ as decimal strings in the file but are stored as integers in memory.
 
 ---
 
-## 6. Phase 3 — LLM Analysis (`main.py` + `prompts.py`)
+## 6. IDA Python API Layer (`idapro_client.py`)
 
-### 6.1 Analysis loop (per function, in worklist order)
+### 6.1 FunctionContextExtractor
+
+The single interface between all pipeline phases and the open IDA database.
+All IDA Python modules (`idautils`, `idc`, `ida_funcs`, etc.) are imported
+**lazily inside methods** — the module itself can be imported before
+`idapro.open_database()` is called.
+
+| Method | IDA API used |
+|---|---|
+| `get_all_auto_functions()` | `idautils.Functions()`, `idc.get_func_name()`, `ida_funcs.get_func()` |
+| `get_functions_by_name(targets)` | `idc.get_name_ea_simple()`, `ida_funcs.get_func()` |
+| `get_function_count()` | `ida_funcs.get_func_qty()` |
+| `extract(func_row)` | all extractors below |
+| `name_exists(name)` | `idc.get_name_ea_simple()` |
+| `_pseudocode(ea)` | `ida_hexrays.decompile(ea)` → `str(cfunc)` |
+| `_strings(ea)` | `idautils.FuncItems()`, `idautils.XrefsFrom()`, string cache |
+| `_imports(ea)` | `idautils.FuncItems()`, `idautils.XrefsFrom()`, import cache |
+| `_callees(ea)` | `idautils.FuncItems()`, `idautils.XrefsFrom()`, `ida_funcs.get_func()` |
+| `_callers(ea)` | `idautils.XrefsTo()`, `ida_funcs.get_func()` |
+| `_comments(ea)` | `idc.get_cmt(ea, 0/1)` |
+| `_basic_blocks(ea)` | `ida_funcs.get_func()`, `ida_gdl.FlowChart()` |
+
+### 6.2 Shared caches
+
+| Cache | Built by | Used by |
+|---|---|---|
+| `_import_map()` | `ida_nalt.get_import_module_qty/enum_import_names` | Phase 1 (graph build), Phase 3 (imports extractor) |
+| `_string_map()` | `idautils.Strings()` | Phase 1 (graph build), Phase 3 (strings extractor) |
+
+Both are built once and stored on the extractor instance. `CallGraphBuilder`
+receives the extractor and calls `extractor._import_map()` / `extractor._string_map()`
+directly.
+
+### 6.3 Targeted function mode (`--function`)
+
+`get_functions_by_name(targets)` accepts a mix of names and hex addresses:
+- If a target starts with `0x`, it is parsed as a hex integer address.
+- Otherwise `idc.get_name_ea_simple(target)` resolves the name.
+- The resolved address is passed to `ida_funcs.get_func()` to get the canonical
+  function start and size.
+- Unresolvable targets produce a warning and are skipped.
+
+In `run_analysis`, when `target_functions` is set:
+- The checkpoint is bypassed — every specified function is re-analyzed.
+- The auto-generated prefix filter is bypassed — any named function can be targeted.
+
+### 6.4 Rename application
+
+```python
+idc.set_name(ea, new_name, idc.SN_NOCHECK)
+```
+
+`SN_NOCHECK` skips IDA's name-validity check (the validator in `validator.py`
+already enforces snake_case rules). Changes are written to the open IDB immediately
+and flushed to disk by `idapro.close_database()`.
+
+---
+
+## 7. Phase 3 — LLM Analysis (`main.py` + `prompts.py`)
+
+### 7.1 Analysis loop (per function, in worklist order)
 
 ```
 1. KB skip check     — if kb.is_phase3_done(addr):  skip
-2. Checkpoint skip   — if checkpoint.is_done(ea):   skip
-3. Extract context   — idasql_client.FunctionContextExtractor.extract()
+2. Checkpoint skip   — if checkpoint.is_done(ea):   skip  (bypassed in targeted mode)
+3. Extract context   — FunctionContextExtractor.extract()
 4. Guard: pseudocode — skip if missing or < min_pseudocode_lines
-5. Callee injection  — kb.get_callee_summaries(graph.callees_of(ea))
-6. Build prompt      — build_user_prompt(ctx, callee_kb_entries)
-7. LLM call          — OllamaClient.analyze(SYSTEM_PROMPT, user_prompt)
-8. KB write          — always, after every successful LLM call (see §6.2)
-9. Validate rename   — validate_llm_output(raw_response, config)
-10. Apply rename      — only if --apply and validation passed
-11. Mark checkpoint  — checkpoint.mark_done(ea)
+5. Limit check       — if llm_calls_this_run >= limit: break
+6. Callee injection  — kb.get_callee_summaries(graph.callees_of(ea))
+7. Build prompt      — build_user_prompt(ctx, callee_kb_entries)
+8. LLM call          — OllamaClient.analyze(SYSTEM_PROMPT, user_prompt)
+9. KB write          — always, after every successful LLM call (see §7.2)
+10. Validate rename  — validate_llm_output(raw_response, config)
+11. Apply rename     — only if --apply and validation passed
+12. Mark checkpoint  — checkpoint.mark_done(ea)
 ```
 
-Step 8 happens **before** step 9. A function whose rename is rejected still gets
+Step 9 happens **before** step 10. A function whose rename is rejected still gets
 its `summary`, `security_relevant`, and `interesting_behaviors` stored in the KB.
 This matters because rejected functions are still callees of other functions and
 their summaries are useful for Phase 3 context injection.
@@ -293,7 +354,16 @@ their summaries are useful for Phase 3 context injection.
 LLM errors (network or JSON parse) are **not checkpointed** — the function will
 be retried on the next run.
 
-### 6.2 KB entry written per function
+### 7.2 --limit behaviour
+
+`--limit N` is checked at step 5, **after** pseudocode guards but **before** the
+LLM call. This means:
+- Functions skipped by checkpoint, KB, or missing pseudocode do not count toward the limit.
+- The limit counts actual LLM calls made in the current run.
+- The checkpoint is written after each LLM call (step 12), so a clean break at
+  the limit leaves a fully consistent checkpoint for the next run.
+
+### 7.3 KB entry written per function
 
 ```json
 {
@@ -312,28 +382,7 @@ be retried on the next run.
 }
 ```
 
-Call edges are also written to the `call_edges` table after each function so
-Phase 6 can reconstruct call chains without the graph cache.
-
-### 6.3 Callee summary injection (`prompts.py`)
-
-`build_user_prompt(ctx, callee_kb_entries=None)` replaces the bare "Internal
-callees:" name list with structured summaries when KB entries exist:
-
-```
-Internal callees (already analyzed):
-  parse_chunk_length [security-relevant] — Parses hex chunk-size; returns -1 on overflow.
-  alloc_buffer — Wraps malloc; returns NULL on failure; no size validation.
-  sub_401500  [LOW CONFIDENCE 0.42] Possibly initialises a linked list node.
-  sub_401900  (not yet analyzed)
-```
-
-- `confidence < 0.6` entries are labelled `[LOW CONFIDENCE X.XX]` so the caller's
-  LLM analysis explicitly knows the callee data is uncertain.
-- Callees not yet in the KB are shown with `(not yet analyzed)`.
-- Up to 5 not-yet-analyzed callees are shown after the KB entries.
-
-### 6.4 LLM output schema
+### 7.4 LLM output schema
 
 ```json
 {
@@ -353,40 +402,26 @@ Internal callees (already analyzed):
 }
 ```
 
-`summary`, `security_relevant`, `interesting_behaviors` are requested in the
-system prompt but are **not** in `_REQUIRED` in `validator.py` — they are
-optional KB fields. The rename decision depends only on the original required
-fields.
-
-`security_relevant=true` when the function demonstrably reads user-controlled
-data OR performs memory operations without visible bounds checks. The LLM sets
-this; the pipeline does not override it.
-
 ---
 
-## 7. Phase 4 — Refinement (`refiner.py`)
+## 8. Phase 4 — Refinement (`refiner.py`)
 
 **One pass only. No looping.**
 
 For each function in the KB where `phase3_done=1` and `phase4_refined=0`:
 
-1. **Skip** if `confidence >= refinement_confidence_skip` (default 0.85) —
-   high-confidence results rarely change from caller context.
-2. **Skip** if no callers of this function are found in the KB —
-   nothing new to inject.
+1. **Skip** if `confidence >= refinement_confidence_skip` (default 0.85).
+2. **Skip** if no callers of this function are found in the KB.
 3. Re-query the LLM with the original summary + up to 5 caller summaries.
 4. If `changed=true` in the response: update `new_name`, `summary`,
    `confidence`, `security_relevant`, `interesting_behaviors` in-place.
 5. Set `phase4_refined=1` regardless of whether the answer changed.
 
-Refinement system prompt asks the LLM to respond with `changed=false` if nothing
-meaningfully improves, avoiding unnecessary KB writes.
-
 ---
 
-## 8. Phase 5 — Knowledge Base and Vector Index
+## 9. Phase 5 — Knowledge Base and Vector Index
 
-### 8.1 SQLite schema (`kb.py`)
+### 9.1 SQLite schema (`kb.py`)
 
 ```sql
 CREATE TABLE functions (
@@ -410,95 +445,39 @@ CREATE TABLE call_edges (
     callee_address  TEXT NOT NULL,
     PRIMARY KEY (caller_address, callee_address)
 );
-
-CREATE INDEX idx_security   ON functions(security_relevant);
-CREATE INDEX idx_confidence ON functions(confidence);
-CREATE INDEX idx_score      ON functions(score DESC);
-CREATE INDEX idx_phase3     ON functions(phase3_done);
 ```
 
 Database opened with `PRAGMA journal_mode=WAL` for concurrent read safety.
 
-**Address format:** all addresses stored as `"0xABCD"` (uppercase hex, `0x`
-prefix). The `_addr_to_hex()` normaliser handles int → hex, hex string →
-canonical, and decimal string → hex, so callers can pass any form.
+**Address format:** all addresses stored as `"0xABCD"` (uppercase hex, `0x` prefix).
 
-### 8.2 Key KB methods
-
-| Method | Purpose |
-|---|---|
-| `upsert(entry)` | Insert or update a function entry (ON CONFLICT DO UPDATE) |
-| `get(address)` | Retrieve one entry by address (any format) |
-| `is_phase3_done(address)` | Fast done-check for the analysis loop skip |
-| `get_callee_summaries(addrs)` | Retrieve KB entries for callee injection |
-| `get_callers_in_kb(addr, callers)` | Retrieve KB entries for refinement |
-| `get_unrefined(skip_confidence)` | All Phase 4 candidates |
-| `get_all_for_embedding()` | All entries with a non-null summary |
-| `update_after_refinement(...)` | Phase 4 targeted update |
-| `get_call_chain(addr, depth)` | Recursive callee walk for Phase 6 display |
-| `upsert_edge(caller, callee)` / `flush()` | Write call edges in batches |
-
-### 8.3 FAISS vector index (`embedder.py`)
+### 9.2 FAISS vector index (`embedder.py`)
 
 - Model: `nomic-embed-text` via Ollama (configurable via `kb.embed_model`)
 - Index type: `faiss.IndexFlatIP` — flat inner-product index
-- Vectors are L2-normalised before add/search, so inner product = cosine similarity
-- Two files on disk: `kb_vectors.faiss` (binary) + `kb_vectors.faiss.map` (JSON
-  list mapping FAISS row index → address string)
-- Embed API: tries `/api/embed` (Ollama 0.3+) first; falls back to `/api/embeddings`
-- Each entry is embedded as:
-  `"Function: {name} | Summary: {summary} | Behaviors: {behavior1}; {behavior2}"`
-- Index is rebuilt from scratch by `--build-index`; incremental update not implemented
+- Vectors are L2-normalised before add/search (inner product = cosine similarity)
+- Two files: `kb_vectors.faiss` (binary) + `kb_vectors.faiss.map` (JSON address list)
 
 ---
 
-## 9. Phase 6 — Query CLI (`query.py`)
-
-### 9.1 Query modes
+## 10. Phase 6 — Query CLI (`query.py`)
 
 | Flag | Mode | Mechanism |
 |---|---|---|
 | `"<text>"` | Semantic search | FAISS cosine similarity; falls back to confidence ranking if no index |
 | `--report` | Security report | All `security_relevant=1` entries, sorted by confidence |
-| `--chain ADDR` | Call chain | `kb.get_call_chain(addr, depth=4)` walking `call_edges` table |
+| `--chain ADDR` | Call chain | `kb.get_call_chain(addr, depth=4)` walking `call_edges` |
 | `--score-report` | Score ranking | Loads `call_graph.json`, runs `scorer.score_report()`, no KB needed |
 | `--no-vector` | Confidence rank | Skips FAISS; sorts all Phase 3 entries by confidence |
 
-### 9.2 Semantic search fallback
-
-If the FAISS index file does not exist, `run_semantic_query` prints a notice and
-calls `run_confidence_query` instead. No crash; results are just less semantically
-ranked.
-
-### 9.3 Output format (semantic search)
-
-```
-Query: "user-controlled length without bounds check"
-────────────────────────────────────────────────────────────────────────
-  #  1  0x401000       parse_http_header                         conf=0.87 [SECURITY]  sim=0.891
-         Parses an HTTP/1.1 request header into a fixed-size buffer without bounds checking.
-         • Copies user-controlled length via memcpy
-         • No bounds check visible before copy
-  #  2  0x402300       read_multipart_boundary                   conf=0.79 [SECURITY]  sim=0.843
-         ...
-────────────────────────────────────────────────────────────────────────
-  N result(s) returned.
-```
-
 ---
 
-## 10. Configuration Reference
+## 11. Configuration Reference
 
-All fields are in `llm_renamer/config.json`. All scoring weights are config-driven
-— there are no magic numbers in code.
+All fields are in `llm_renamer/config.json`. All scoring weights are config-driven.
 
 ```json
 {
-  "idasql": {
-    "url": "http://localhost:8081",
-    "timeout_seconds": 30
-  },
-
   "ollama": {
     "url": "http://localhost:11434",
     "model": "codellama:13b-instruct",
@@ -536,7 +515,6 @@ All fields are in `llm_renamer/config.json`. All scoring weights are config-driv
   },
 
   "graph": {
-    "timeout_seconds": 300,
     "cache_filename": "call_graph.json",
     "dangerous_sinks": ["memcpy", "memmove", "strcpy", "strcat", "sprintf",
                         "vsprintf", "gets", "recv", "recvfrom", "read",
@@ -563,27 +541,33 @@ All fields are in `llm_renamer/config.json`. All scoring weights are config-driv
 
 ---
 
-## 11. CLI Reference
+## 12. CLI Reference
 
 ### `main.py`
 
 ```
-python main.py [options]
+python main.py --database PATH [options]
 
-Core options:
+Required:
+  --database PATH        Path to the .i64 IDA database
+
+Configuration:
   --config PATH          config.json path  (default: llm_renamer/config.json)
-  --idasql-url URL       override idasql URL
-  --ollama-url URL       override Ollama URL
+  --ollama-url URL       override Ollama URL (e.g. http://remote-host:11434)
   --model NAME           override model name
   --out-dir DIR          directory for all output files  (default: cwd)
 
+Function selection:
+  --function NAME ...    analyze only these functions (name or 0x address); bypasses checkpoint
+  --limit N              stop after N LLM calls; checkpoint saves progress for next run
+
 Run modes:
   (none)                 Review mode — analyse, write review JSON, no renames
-  --apply                Analyse and apply approved renames to idasql
+  --apply                Analyse and apply approved renames to the database
   --apply-file PATH      Apply from an existing review JSON (no LLM, no graph)
 
 Pipeline control:
-  --rebuild-graph        Discard call_graph.json cache and rebuild from idasql
+  --rebuild-graph        Discard call_graph.json cache and rebuild
   --skip-refine          Skip Phase 4 refinement pass
   --build-index          Build FAISS vector index after analysis (Phase 5)
 
@@ -608,17 +592,15 @@ Checkpoint:
 ```
 python query.py [options] [query_text]
 
-  query_text             Free-text semantic query (optional if using --report etc.)
+  query_text             Free-text semantic query
 
   --config PATH          config.json path
   --kb PATH              override knowledge base path
   --index PATH           override FAISS index path
   --out-dir DIR          directory containing output files
-
   --top N                number of results  (default: 20)
   --security-only        restrict to security_relevant=true functions
   --no-vector            skip FAISS; rank by confidence instead
-
   --chain ADDR           show call chain for a hex address (e.g. 0x401000)
   --report               print all security-relevant functions by confidence
   --score-report         print top functions by score (reads call_graph.json)
@@ -626,70 +608,58 @@ python query.py [options] [query_text]
 
 ---
 
-## 12. Invariants and Quality Rules
+## 13. Invariants and Quality Rules
 
 1. **Never rename with confidence < 0.6** without flagging for human review.
-   The threshold in `config.json` (`analysis.confidence_threshold`) is 0.65 by default.
 
 2. **Uncertain callee summaries are labelled, not silently injected.**
    Any callee with `confidence < 0.6` gets `[LOW CONFIDENCE X.XX]` in the prompt.
-   The caller's analysis explicitly accounts for uncertain input.
 
-3. **One refinement pass.** Phase 4 runs exactly once. `phase4_refined=1` is set
-   on every candidate regardless of outcome; there is no retry loop.
+3. **One refinement pass.** Phase 4 runs exactly once per function.
 
 4. **`security_relevant=true` has a narrow definition.** The function must
    demonstrably touch user-controlled data or perform memory operations without
-   visible bounds checks. Proximity to such code is not sufficient.
+   visible bounds checks. Proximity is not sufficient.
 
-5. **Analyst names are never overwritten.** `policy.never_overwrite_analyst_names=true`
-   protects any name not matching an auto-generated prefix pattern.
+5. **Analyst names are never overwritten** unless the user explicitly targets the
+   function with `--function`.
 
-6. **Xref filtering is a weight, not a hard cutoff.** A utility function called
-   by security-critical code should stay in the queue — its score is reduced, not
-   zeroed. If LLM budget runs out, cut from the bottom of the worklist.
+6. **Xref filtering is a weight, not a hard cutoff.**
 
-7. **KB write happens before rename validation.** A function whose suggested name
-   is rejected still has its `summary` and `security_relevant` stored. These fields
-   are independent of the rename and are valuable for callee injection.
+7. **KB write happens before rename validation.** Summary and security fields
+   are independent of the rename decision and valuable for callee injection.
 
-8. **Address format is canonical hex.** All KB primary keys are `"0xABCD"` strings
-   (uppercase hex, `0x` prefix). The `_addr_to_hex()` normaliser in `kb.py`
-   converts any input form. Never store decimal-format addresses in the KB.
+8. **Address format is canonical hex.** All KB primary keys are `"0xABCD"`
+   (uppercase hex, `0x` prefix).
 
 ---
 
-## 13. Dependencies
+## 14. Dependencies
 
 ```
-Python >= 3.9
-faiss-cpu >= 1.7.4    (Phase 5/6 only — install: pip install faiss-cpu numpy)
+Python >= 3.9  (run from IDA's bundled Python or any env with idapro importable)
+idapro         Installed alongside IDA Pro 9+
+faiss-cpu >= 1.7.4    (Phase 5/6 only — pip install faiss-cpu numpy)
 numpy >= 1.24.0       (required by faiss-cpu)
 ```
 
-All other modules use Python stdlib only (`sqlite3`, `json`, `urllib`, `heapq`,
-`dataclasses`). Phases 1–4 and the rename path run without faiss-cpu installed.
-Phases 5–6 (`--build-index`, semantic queries in `query.py`) require it and will
-print a clear install message if it is missing.
+All other modules use Python stdlib only. Phases 1–4 run without faiss-cpu.
 
 External services required at runtime:
-- `idasql` HTTP server (for Phases 1 and 3)
-- `ollama` with a chat model (for Phase 3 LLM calls) and an embed model (for Phase 5)
+- `ollama` with a chat model (Phase 3) and an embed model (Phase 5)
+  — can run on a remote host; pass `--ollama-url` to specify the address
 
 ---
 
-## 14. Constraints and Non-Goals
+## 15. Constraints and Non-Goals
 
-- **IDA / idasql only.** No Ghidra or Binary Ninja backend. A future backend
-  would need to implement the `FunctionContextExtractor` interface and the call
-  graph queries in `call_graph.py`.
-- **Auto-generated names only.** Phase 3 only renames functions matching
-  `auto_generated_prefixes`. Named functions are not renamed — but their
-  summaries can still be written to the KB and used as callee context.
+- **IDA Pro / idapro only.** No Ghidra or Binary Ninja backend. A future backend
+  would need to implement the `FunctionContextExtractor` interface.
+- **Auto-generated names only** (by default). Named functions are not renamed but
+  their summaries can still be written to the KB for callee context. Use `--function`
+  to bypass the prefix filter for individual functions.
 - **No taint analysis.** `input_reachable` is a call-graph heuristic, not a
-  dataflow analysis. For precise taint tracking, post-process the KB output
-  with angr or a similar tool.
+  dataflow analysis.
 - **Not a vulnerability proof.** The output is a prioritised reading list with
   semantic annotations. A human researcher confirms findings.
-- **No fuzzing harness generation.** Out of scope; a future `harness_gen.py`
-  can consume Phase 6 output.
+- **No fuzzing harness generation.** Out of scope.
