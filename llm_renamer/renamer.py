@@ -45,9 +45,11 @@ class RenamePolicy:
     # Rename application
     # ------------------------------------------------------------------
 
-    def apply_rename(self, ea: int, new_name: str) -> tuple[bool, str]:
+    def apply_rename(self, ea: int, new_name: str, summary: str = "") -> tuple[bool, str]:
         import idc
         ok = idc.set_name(ea, new_name, idc.SN_NOCHECK)
-        if ok:
-            return True, new_name
-        return False, f"idc.set_name failed for 0x{ea:X}"
+        if not ok:
+            return False, f"idc.set_name failed for 0x{ea:X}"
+        if summary:
+            idc.set_func_cmt(ea, summary, 1)  # repeatable comment, visible in callers too
+        return True, new_name

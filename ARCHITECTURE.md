@@ -24,6 +24,8 @@ This is encoded directly in the scoring formula (§4).
 
 ## 2. System Overview
 
+### Full pipeline mode (default)
+
 ```
 idapro.open_database("target.i64", run_auto_analysis=False)
       │
@@ -55,8 +57,8 @@ idapro.open_database("target.i64", run_auto_analysis=False)
        ▼
 ┌──────────────┐
 │  Phase 5     │  embedder.py            Embed summaries → FAISS index
-│  Index       │  → kb_vectors.faiss     (triggered by --build-index)
-└──────┬───────┘    → kb_vectors.faiss.map
+│  Index       │  → kb_vectors.faiss     (triggered by --build-index only)
+└──────┬───────┘
        │
        ▼
 ┌──────────────┐
@@ -64,15 +66,37 @@ idapro.open_database("target.i64", run_auto_analysis=False)
 │  Query       │  (reads KB + FAISS)     Semantic search / call chains
 └──────────────┘
 
-idapro.close_database()   ← renames (idc.set_name) are flushed here
+idapro.close_database()   ← renames (idc.set_name) and comments (idc.set_func_cmt) flushed here
 ```
+
+### Quick / standalone mode (--quick or --function)
+
+```
+idapro.open_database("target.i64", run_auto_analysis=False)
+      │
+      ▼
+┌──────────────┐
+│  Phase 3     │  LLM analysis (no callee context injection)
+│  LLM only   │  → knowledge_base.sqlite
+└──────────────┘
+      │  --apply: idc.set_name + idc.set_func_cmt per function
+      ▼
+idapro.close_database()
+```
+
+Phases 1, 2, and 4 are skipped entirely. Useful for:
+- Testing LLM output on a specific function before running the full pipeline
+- Quickly renaming known interesting functions by name or address
+- Running without needing the full graph build overhead
+
+`--function NAME ...` implies `--quick` automatically.
 
 **Dependencies between phases:**
 - Phase 1 uses IDA Python API directly. Result cached to `call_graph.json`.
 - Phase 2 reads the Phase 1 cache. Does not call IDA API.
-- Phase 3 reads KB entries written by earlier Phase 3 iterations (callee summary injection).
-- Phase 4 reads Phase 3 KB entries and writes back to the same rows.
-- Phase 5 reads Phase 3/4 KB entries. Can run independently after Phase 3.
+- Phase 3 reads KB entries written by earlier Phase 3 iterations (callee summary injection). In quick mode, graph is None so callee injection is skipped.
+- Phase 4 reads Phase 3 KB entries and writes back to the same rows. Skipped in quick mode.
+- Phase 5 reads Phase 3/4 KB entries. Triggered only by `--build-index`.
 - Phase 6 reads Phase 3/4 KB entries and the Phase 5 FAISS index.
 
 ---
@@ -315,15 +339,21 @@ In `run_analysis`, when `target_functions` is set:
 - The checkpoint is bypassed — every specified function is re-analyzed.
 - The auto-generated prefix filter is bypassed — any named function can be targeted.
 
-### 6.4 Rename application
+### 6.4 Rename application and IDA annotation
 
 ```python
-idc.set_name(ea, new_name, idc.SN_NOCHECK)
+idc.set_name(ea, new_name, idc.SN_NOCHECK)   # rename
+idc.set_func_cmt(ea, summary, 1)              # repeatable comment (visible in callers)
 ```
 
 `SN_NOCHECK` skips IDA's name-validity check (the validator in `validator.py`
-already enforces snake_case rules). Changes are written to the open IDB immediately
-and flushed to disk by `idapro.close_database()`.
+already enforces snake_case rules). Both calls happen inside `RenamePolicy.apply_rename()`
+when `--apply` is set and a summary was produced by the LLM. Changes are flushed
+to disk by `idapro.close_database()`.
+
+The comment is **repeatable** (`repeatable=1`) so it appears in the IDA listing
+at every call site, not just at the function definition — making the LLM's
+analysis immediately visible while browsing callers.
 
 ---
 
@@ -558,12 +588,13 @@ Configuration:
   --out-dir DIR          directory for all output files  (default: cwd)
 
 Function selection:
-  --function NAME ...    analyze only these functions (name or 0x address); bypasses checkpoint
-  --limit N              stop after N LLM calls; checkpoint saves progress for next run
+  --function NAME ...    analyze only these functions; implies --quick
+  --limit N              stop after N LLM calls; checkpoint saves progress
+  --quick                skip Phases 1/2/4 (graph, scoring, refinement)
 
 Run modes:
   (none)                 Review mode — analyse, write review JSON, no renames
-  --apply                Analyse and apply approved renames to the database
+  --apply                Analyse, apply renames, and write IDA function comments
   --apply-file PATH      Apply from an existing review JSON (no LLM, no graph)
 
 Pipeline control:
@@ -622,7 +653,8 @@ python query.py [options] [query_text]
    visible bounds checks. Proximity is not sufficient.
 
 5. **Analyst names are never overwritten** unless the user explicitly targets the
-   function with `--function`.
+   function with `--function`. IDA function comments written on apply are
+   repeatable so they appear at every call site.
 
 6. **Xref filtering is a weight, not a hard cutoff.**
 

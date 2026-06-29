@@ -80,21 +80,39 @@ Key settings:
 
 ## 3. Run
 
+### Quick / standalone mode *(for testing or targeting specific functions)*
+
+```bash
+python main.py --database target.i64 --function sub_1c0012232
+python main.py --database target.i64 --function sub_1c0012232 --apply
+python main.py --database target.i64 --function 0x1c0012232 sub_401000
+```
+
+`--function` implies `--quick` automatically. The call graph build, scoring, and refinement passes are all skipped — the tool goes straight to LLM analysis for the specified function(s) and returns in seconds. Accepts names or hex addresses. Works on any function, not just auto-generated ones.
+
+Use `--quick` without `--function` to run the full function list without the graph overhead:
+
+```bash
+python main.py --database target.i64 --quick
+```
+
+### Full pipeline mode *(for bulk analysis of a binary)*
+
 **Review mode** *(default — no database changes)*
 
 ```bash
 python main.py --database /path/to/target.i64
 ```
 
-Analyzes every `sub_*` / `j_*` / `nullsub_*` function, sends context to Ollama, and writes a review file. The database is not modified.
+Builds the call graph, scores all functions, analyzes every `sub_*` / `j_*` / `nullsub_*` in bottom-up order, and writes a review file. The database is not modified.
 
-**Apply mode** *(writes renames into the .i64)*
+**Apply mode** *(writes renames and IDA comments into the .i64)*
 
 ```bash
 python main.py --database target.i64 --apply
 ```
 
-Same as review mode but also calls `idc.set_name()` for every approved suggestion. The `.i64` is updated when the database closes. Prompts for confirmation before starting.
+Same as review mode but also calls `idc.set_name()` for every approved rename and writes the LLM summary as a repeatable function comment (`idc.set_func_cmt`), visible in the IDA listing and in callers. Changes are saved when the database closes. Prompts for confirmation before starting.
 
 **Process only a batch** *(useful for large binaries)*
 
@@ -103,16 +121,6 @@ python main.py --database target.i64 --limit 200
 ```
 
 Stops after 200 LLM calls. The checkpoint is saved automatically; the next run picks up where this one left off.
-
-**Target a specific function**
-
-```bash
-python main.py --database target.i64 --function sub_1c0012232
-python main.py --database target.i64 --function sub_1c0012232 --apply
-python main.py --database target.i64 --function 0x1c0012232 sub_401000
-```
-
-Analyzes only the named function(s), bypassing the checkpoint and the auto-generated prefix filter. Accepts names or hex addresses. Combine with `--apply` to rename immediately.
 
 **Ollama on a remote host**
 
@@ -126,15 +134,13 @@ python main.py --database target.i64 --ollama-url http://192.168.1.50:11434
 python main.py --database target.i64 --apply-file llm_renames_review.json
 ```
 
-Reads an existing review JSON and applies only the approved renames. Useful for reviewing proposals in an editor before committing them.
+Reads an existing review JSON and applies only the approved renames.
 
 **Reset progress**
 
 ```bash
 python main.py --database target.i64 --clear-checkpoint
 ```
-
-Deletes the checkpoint so all functions are reprocessed on the next run.
 
 ### All CLI options
 
@@ -151,12 +157,13 @@ Configuration:
   --out-dir DIR          Output directory (default: current working directory)
 
 Function selection:
-  --function NAME ...    Analyze only these function(s) by name or hex address
+  --function NAME ...    Analyze only these function(s); implies --quick
   --limit N              Stop after N LLM calls; checkpoint saves progress
+  --quick                Skip call graph, scoring, and refinement (Phases 1/2/4)
 
 Run modes:
   (none)                 Review mode — analyze and write review JSON, no renames
-  --apply                Analyze and apply approved renames
+  --apply                Analyze and apply approved renames + IDA comments
   --apply-file PATH      Apply from an existing review JSON (no LLM calls)
 
 Pipeline control:

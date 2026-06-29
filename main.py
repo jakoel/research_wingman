@@ -33,8 +33,9 @@ Options
   --model NAME           Override Ollama model name
   --out-dir DIR          Directory for output files (default: cwd)
   --limit N              Stop after analyzing N functions (checkpoint saves progress)
-  --function NAME ...    Analyze only the named function(s); accepts names or 0x addresses
-  --apply                Analyze AND apply approved renames into the database
+  --function NAME ...    Analyze only the named function(s); implies --quick
+  --quick                Skip call graph build, scoring, and refinement (Phases 1/2/4)
+  --apply                Analyze AND apply approved renames + IDA comments into the database
   --apply-file PATH      Apply renames from an existing review JSON (no LLM)
   --rebuild-graph        Discard cached call graph and rebuild
   --skip-refine          Skip Phase 4 top-down refinement pass
@@ -301,13 +302,14 @@ def run_analysis(
             # ---- apply if requested ---------------------------------------
             apply_success = False
             apply_detail  = ""
+            summary = str(raw_response.get("summary", "")).strip()
 
             if apply_mode:
                 allowed, policy_reason = policy.can_rename(name)
                 if allowed:
                     unique_name = policy.resolve_conflict(sanitized)
                     if unique_name:
-                        ok, detail = policy.apply_rename(ea, unique_name)
+                        ok, detail = policy.apply_rename(ea, unique_name, summary=summary)
                         if ok:
                             apply_success = True
                             apply_detail  = unique_name
@@ -514,7 +516,12 @@ def _parse_args():
     )
     p.add_argument(
         "--function", metavar="NAME", nargs="+", default=None,
-        help="Analyze only these function(s) by name or hex address; bypasses checkpoint",
+        help="Analyze only these function(s) by name or hex address; implies --quick",
+    )
+    p.add_argument(
+        "--quick", action="store_true",
+        help="Skip call graph build, scoring, and refinement (Phases 1/2/4); "
+             "useful for testing or targeting specific functions",
     )
 
     mode = p.add_mutually_exclusive_group()
@@ -576,7 +583,7 @@ def _run(args, config, paths, db_path):
     _check_ollama(config)
 
     if args.apply:
-        print("[llm_renamer] WARNING: apply mode will write renames into the database.")
+        print("[llm_renamer] WARNING: apply mode will write renames + IDA comments into the database.")
         answer = input("Proceed? [y/N] ").strip().lower()
         if answer != "y":
             print("Aborted.")
@@ -588,23 +595,30 @@ def _run(args, config, paths, db_path):
         run_apply_from_file(config, paths, args.apply_file, extractor)
         return
 
-    # ---- Phase 1: build / load call graph --------------------------------
-    graph = load_or_build(
-        extractor, config,
-        paths["call_graph"],
-        force_rebuild=args.rebuild_graph,
-    )
+    # --function implies --quick (no graph needed for targeted runs)
+    quick = args.quick or bool(args.function)
 
-    # Pre-compute scores for KB storage
-    depths = depth_from_leaves(graph)
-    scores: dict[int, float] = {
-        addr: score_node(node, config) + float(depths.get(addr, 0))
-        for addr, node in graph.nodes.items()
-    }
+    if quick:
+        print("[llm_renamer] Quick mode — skipping call graph build and refinement.")
+        graph  = None
+        scores = None
+        kb     = KnowledgeBase(paths["knowledge_base"])
+    else:
+        # ---- Phase 1: build / load call graph ----------------------------
+        graph = load_or_build(
+            extractor, config,
+            paths["call_graph"],
+            force_rebuild=args.rebuild_graph,
+        )
+        # Pre-compute scores for KB storage
+        depths = depth_from_leaves(graph)
+        scores: dict[int, float] = {
+            addr: score_node(node, config) + float(depths.get(addr, 0))
+            for addr, node in graph.nodes.items()
+        }
+        kb = KnowledgeBase(paths["knowledge_base"])
 
     # ---- Phase 3 + KB ----------------------------------------------------
-    kb = KnowledgeBase(paths["knowledge_base"])
-
     run_analysis(
         config=config,
         paths=paths,
@@ -618,12 +632,13 @@ def _run(args, config, paths, db_path):
         target_functions=args.function,
     )
 
-    # ---- Phase 4: top-down refinement ------------------------------------
-    if not args.skip_refine:
+    # ---- Phase 4: top-down refinement (skipped in quick mode) ------------
+    if quick or args.skip_refine:
+        if not quick:
+            print("[llm_renamer] Skipping Phase 4 refinement (--skip-refine).")
+    else:
         llm = OllamaClient(config)
         Refiner(graph, kb, llm, config).run()
-    else:
-        print("[llm_renamer] Skipping Phase 4 refinement (--skip-refine).")
 
     # ---- Phase 5: build FAISS index --------------------------------------
     if args.build_index:
