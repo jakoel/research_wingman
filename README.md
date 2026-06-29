@@ -1,7 +1,7 @@
 # llm_renamer
 
 Renames auto-generated IDA Pro function names (`sub_*`, `j_*`, `nullsub_*`, …) using a locally-running LLM.  
-Opens the `.i64` database directly via **idapro** — no idasql server, no IDA plugin required.
+Opens the `.i64` database directly via **idapro** 
 
 ---
 
