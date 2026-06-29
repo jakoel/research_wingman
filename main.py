@@ -539,6 +539,10 @@ def _parse_args():
 def main():
     args = _parse_args()
 
+    # Allow comma-separated function names: --function a,b,c or --function a b c
+    if args.function:
+        args.function = [f for item in args.function for f in item.split(",") if f]
+
     # ---- validate database path ------------------------------------------
     db_path = os.path.abspath(args.database)
     if not os.path.exists(db_path):
