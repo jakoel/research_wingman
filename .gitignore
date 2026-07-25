@@ -1,0 +1,17 @@
+# Analysis workspaces — one per database, created next to the .i64
+*.rh/
+
+# IDA databases and their working files
+*.i64
+*.idb
+*.id0
+*.id1
+*.id2
+*.nam
+*.til
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/

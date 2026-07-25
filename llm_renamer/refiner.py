@@ -1,5 +1,5 @@
 """
-Phase 4 — Top-down refinement pass.
+Top-down refinement pass.
 
 After the bottom-up LLM pass (Phase 3) completes, one downward pass re-queries
 functions whose caller context was unavailable when they were first analyzed.
@@ -73,7 +73,7 @@ class Refiner:
             addr_int = _parse_addr(addr_str)
 
             if addr_int is None:
-                self._kb.mark_phase4_refined(addr_str)
+                self._kb.mark_refined(addr_str)
                 continue
 
             callers_in_graph = self._graph.callers_of(addr_int)
@@ -81,7 +81,7 @@ class Refiner:
 
             if not caller_entries:
                 # No caller context available; mark done with no change.
-                self._kb.mark_phase4_refined(addr_str)
+                self._kb.mark_refined(addr_str)
                 continue
 
             prompt = _build_prompt(entry, caller_entries)
@@ -89,11 +89,11 @@ class Refiner:
                 raw = self._llm.analyze(_SYSTEM_PROMPT, prompt)
             except LLMError as e:
                 print(f"[refiner] LLM error for {addr_str}: {e}")
-                self._kb.mark_phase4_refined(addr_str)
+                self._kb.mark_refined(addr_str)
                 continue
 
             if not isinstance(raw, dict) or not raw.get("changed"):
-                self._kb.mark_phase4_refined(addr_str)
+                self._kb.mark_refined(addr_str)
                 continue
 
             # Something improved — update the KB

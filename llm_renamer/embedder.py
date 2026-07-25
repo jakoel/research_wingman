@@ -1,9 +1,10 @@
 """
-Phase 5 — Local embedding + FAISS vector index.
+Local embedding + FAISS vector index.
 
-Embeds function summaries via Ollama and stores them in a FAISS flat cosine-
-similarity index so Phase 6 can answer free-text queries like
-"user-controlled length without bounds check".
+Embeds function summaries via Ollama into a FAISS flat cosine-similarity index
+so `rh ask` can answer free-text questions like "user-controlled length without
+bounds check". The index is rebuilt automatically when it falls behind the
+knowledge base.
 
 Requires: pip install faiss-cpu numpy
 """
@@ -45,13 +46,13 @@ class Embedder:
       <faiss_file>.map   — JSON list of function addresses (FAISS row -> address)
     """
 
-    def __init__(self, config: dict) -> None:
+    def __init__(self, config: dict, index_path: str) -> None:
         _require()
         self._url = config["ollama"]["url"].rstrip("/")
-        self._model = config.get("kb", {}).get("embed_model", "nomic-embed-text")
+        self._model = config["ollama"].get("embed_model", "nomic-embed-text")
         self._timeout = int(config["ollama"].get("timeout_seconds", 120))
-        self._index_path = config.get("kb", {}).get("faiss_file", "kb_vectors.faiss")
-        self._map_path = self._index_path + ".map"
+        self._index_path = index_path
+        self._map_path = index_path + ".map"
         self._index = None
         self._id_map: list[str] = []
 

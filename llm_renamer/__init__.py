@@ -1,8 +1,8 @@
 """
-llm_renamer — standalone package.
+llm_renamer — LLM-assisted analysis of IDA Pro databases.
 
-Entry point: main.py (run as  python main.py --help)
+Entry point: rh.py  (run  python rh.py --help)
 
-Requires an IDA Pro installation with idapro available.
-Opens the .i64 database directly via idapro.open_database() — no idasql server needed.
+Requires an IDA Pro installation with the `idapro` package importable.
+Opens the .i64 database directly via idapro.open_database().
 """
