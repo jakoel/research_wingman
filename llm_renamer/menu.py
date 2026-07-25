@@ -99,7 +99,8 @@ class Session:
     9  Everything          (the overnight run)
 
   RESULTS
-    a  Ask     s  Status     p  Apply to database     e  Export     q  Quit""")
+    a  Ask     s  Status     p  Apply to database     e  Export
+    m  Maintenance           q  Quit""")
 
         choice = input("\n  > ").strip().lower()
         actions = {
@@ -107,7 +108,7 @@ class Session:
             "4": self._explore, "5": self._one, "6": self._around,
             "7": self._path, "8": self._top_n, "9": self._everything,
             "a": self._ask, "s": self._status, "p": self._apply,
-            "e": self._export,
+            "e": self._export, "m": self._maintenance,
         }
         if choice in ("q", "quit", "exit"):
             return False
@@ -256,7 +257,43 @@ class Session:
             kb.close()
 
     def _status(self) -> None:
-        ask_mod.status(self.config, self.ws)
+        ask_mod.status(self.config, self.ws, show_next=False)
+
+    def _maintenance(self) -> None:
+        print("\n    1  Rebuild the call graph      (no LLM, takes minutes)")
+        print("    2  Rebuild the search index    (re-embeds every summary)")
+        print("    3  Change the model            "
+              f"(currently {self.config['ollama']['model']})")
+        print("    4  Delete all analysis results (cannot be undone)")
+        print("    b  Back")
+        choice = input("  > ").strip().lower()
+
+        if choice == "1":
+            self.graph = load_or_build(self.extractor, self.config,
+                                       self.ws.call_graph, force_rebuild=True)
+        elif choice == "2":
+            ask_mod.build_index(self.config, self.ws)
+        elif choice == "3":
+            new = input(f"  Model [{self.config['ollama']['model']}]: ").strip()
+            if new:
+                self.config["ollama"]["model"] = new
+                print(f"  Using {new} for this session. To make it permanent, "
+                      "edit llm_renamer/config.json")
+        elif choice == "4":
+            if not os.path.exists(self.ws.kb):
+                print("  Nothing to delete.")
+                return
+            kb = KnowledgeBase(self.ws.kb)
+            n = kb.stats()["analyzed"]
+            kb.close()
+            print(f"\n  This deletes {n} analyzed function(s) and every rename "
+                  "proposal.\n  Renames already written into the database are "
+                  "NOT undone.")
+            if _yes("  Really delete?", default=False):
+                kb = KnowledgeBase(self.ws.kb)
+                removed = kb.reset()
+                kb.close()
+                print(f"  Deleted {removed} result(s).")
 
     def _apply(self) -> None:
         kb = KnowledgeBase(self.ws.kb) if os.path.exists(self.ws.kb) else None
@@ -294,10 +331,25 @@ class Session:
         if not selection:
             print("  Nothing selected.")
             return
+
+        # If the whole selection is already done, offer to redo it here rather
+        # than printing a flag the user would have to leave the session to use.
+        if not reanalyze:
+            plan = pipeline.build_plan(
+                self.config, self.ws, self.extractor, self.graph,
+                addresses=selection, label=label,
+            )
+            if not plan.todo and plan.already_done:
+                print(f"\n  All {plan.already_done} of these are already "
+                      "analyzed.")
+                if not _yes("  Analyze them again?", default=False):
+                    return
+                reanalyze = True
+
         pipeline.analyze(
             self.config, self.ws, self.extractor,
             addresses=selection, label=label, reanalyze=reanalyze,
-            confirm=_confirm_plan,
+            confirm=_confirm_plan, graph=self.graph,
         )
 
     def _resolve(self, prompt: str) -> int | None:

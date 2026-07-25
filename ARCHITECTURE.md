@@ -708,6 +708,21 @@ path. `--workspace DIR` relocates the whole directory if needed.
 
 ## 12. CLI Reference
 
+The interactive session is the primary interface; subcommands exist for
+scripting. `rh.py` rewrites its own argv so the session is the default:
+
+```
+rh.py                  → discover a .i64 in the cwd, then `menu <that>`
+rh.py target.i64       → `menu target.i64`
+rh.py map target.i64   → unchanged
+```
+
+`_normalize_argv()` prepends `menu` whenever the first argument is neither a
+known command nor a flag. Everything the CLI can do is reachable from the
+session, including maintenance (rebuild graph, rebuild index, switch model,
+delete results) — the session must never print a flag the user would have to
+exit and retype.
+
 ```
 python rh.py COMMAND DATABASE [options]
 

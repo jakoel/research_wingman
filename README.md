@@ -23,18 +23,19 @@ So `rh` splits into two halves:
 - **`analyze`** — costs LLM calls, so it always requires an explicit scope and
   quotes the cost before spending it. There is no accidental overnight run.
 
-Start here:
-
-```bash
-python rh.py menu target.i64
-```
-
-That opens the database once and keeps it open for the session, so browsing is
-instant.
-
 ---
 
-## The session
+## Just run it
+
+```bash
+python rh.py target.i64
+```
+
+That's the whole interface. It opens the database once, keeps it open for the
+session, and everything is a menu choice — there are no flags to remember.
+
+Run `python rh.py` with no arguments and it finds a `.i64` in the current
+directory and opens that.
 
 ```
 ────────────────────────────────────────────────────────────────────────
@@ -55,8 +56,13 @@ instant.
     9  Everything          (the overnight run)
 
   RESULTS
-    a  Ask     s  Status     p  Apply to database     e  Export     q  Quit
+    a  Ask     s  Status     p  Apply to database     e  Export
+    m  Maintenance           q  Quit
 ```
+
+`m` covers rebuilding the call graph, rebuilding the search index, switching
+model, and deleting results — so you never have to leave the session to do
+housekeeping.
 
 Options 1–4 cost nothing. Options 5–9 show you something like this first, and
 wait:
@@ -82,10 +88,12 @@ accurate after the first one.
 
 ## A worked example
 
-You're looking for a parsing bug in a network service.
+You're looking for a parsing bug in a network service. This is the same flow
+the menu walks you through — shown as commands so each step is explicit.
 
 ```bash
 # 1. Build the map once. Needs IDA, takes minutes, no LLM calls.
+#    (The session offers to do this for you on first open.)
 python rh.py map target.i64 --build
 
 # 2. Where does network data arrive and where does it end up?
@@ -118,6 +126,9 @@ python rh.py apply target.i64
 ---
 
 ## Commands
+
+You don't need these — the session covers all of it. They exist for scripting
+and for when you already know exactly what you want.
 
 ### `map` — free, instant, no LLM
 

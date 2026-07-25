@@ -2,10 +2,16 @@
 """
 rh — a copilot for reverse engineering an IDA Pro database.
 
+Just point it at a database:
+
+    python rh.py target.i64            opens the interactive session
+    python rh.py                       finds a database here and opens it
+
+Everything is reachable from that menu. The subcommands below exist for
+scripting; you never need to remember them.
+
 The call graph is a free map of the binary. The LLM is an expensive lens you
 point at one place on that map. So: look first, then spend.
-
-    rh menu target.i64                 interactive session — start here
 
     rh map target.i64                  overview: entry points, imports, size
     rh map target.i64 --suspicious     what's worth looking at
@@ -91,7 +97,14 @@ class _OpenDatabase:
         self._db_path = db_path
 
     def __enter__(self):
-        import idapro
+        try:
+            import idapro
+        except ImportError:
+            _die("this command needs IDA Pro's `idapro` package, which is not "
+                 "importable here.\n"
+                 "       Run it with IDA's bundled Python, or add IDA's "
+                 "python directory to PYTHONPATH.\n"
+                 "       `rh map` / `ask` / `status` / `export` work without it.")
         self._idapro = idapro
         print(f"[rh] Opening {self._db_path}")
         idapro.open_database(self._db_path, run_auto_analysis=False)
@@ -521,9 +534,62 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+_COMMANDS = {"menu", "map", "analyze", "apply", "ask", "status", "export"}
+_DB_SUFFIXES = (".i64", ".idb")
+
+
+def _discover_database() -> str | None:
+    """Find a database to open when the user just runs `rh.py` with no args."""
+    import glob
+    found = sorted(
+        f for suffix in _DB_SUFFIXES for f in glob.glob(f"*{suffix}")
+    )
+    if not found:
+        return None
+    if len(found) == 1:
+        return found[0]
+    print("\n  Which database?\n")
+    for i, name in enumerate(found, 1):
+        print(f"    {i}  {name}")
+    choice = input("\n  > ").strip()
+    try:
+        return found[int(choice) - 1]
+    except (ValueError, IndexError):
+        return None
+
+
+def _normalize_argv(argv: list[str]) -> list[str]:
+    """
+    Make the interactive session the default.
+
+        rh.py                 → find a database nearby, open the menu
+        rh.py target.i64      → open the menu on it
+        rh.py map target.i64  → the explicit command, unchanged
+
+    Subcommands stay available for scripting; nobody has to remember them.
+    """
+    if not argv:
+        db = _discover_database()
+        if db is None:
+            return []
+        return ["menu", db]
+    first = argv[0]
+    if first in _COMMANDS or first.startswith("-"):
+        return argv
+    return ["menu"] + argv
+
+
 def main() -> None:
     parser = _build_parser()
-    args, extras = parser.parse_known_args()
+    argv = _normalize_argv(sys.argv[1:])
+
+    if not argv:
+        parser.print_help()
+        print(f"\n  No {' or '.join(_DB_SUFFIXES)} file in this directory.\n"
+              f"  Point it at one:  python rh.py /path/to/target.i64\n")
+        sys.exit(1)
+
+    args, extras = parser.parse_known_args(argv)
 
     if not getattr(args, "func", None):
         parser.print_help()

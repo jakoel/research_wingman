@@ -183,8 +183,13 @@ def score_report(config: dict, workspace: Workspace, top_n: int = 30) -> None:
 # Status
 # ---------------------------------------------------------------------------
 
-def status(config: dict, workspace: Workspace) -> None:
-    """What has been done for this database, and what to run next."""
+def status(config: dict, workspace: Workspace, show_next: bool = True) -> None:
+    """
+    What has been done for this database.
+
+    `show_next` suggests follow-up commands — suppressed inside the interactive
+    session, where the menu is the way to do those things.
+    """
     print(f"\n  Database  : {workspace.db_path}")
     print(f"  Workspace : {workspace.dir}")
     print(_SEP)
@@ -192,8 +197,8 @@ def status(config: dict, workspace: Workspace) -> None:
     name = os.path.basename(workspace.db_path)
     if not os.path.exists(workspace.kb):
         print("  No analysis yet.\n")
-        print(f"  Next:  rh menu {name}            interactive session\n"
-              f"         rh map {name}             look around first (free)\n")
+        if show_next:
+            print(f"  Next:  python rh.py {name}\n")
         return
 
     kb = KnowledgeBase(workspace.kb)
@@ -222,10 +227,5 @@ def status(config: dict, workspace: Workspace) -> None:
     print(f"  Semantic index  : {index_state}")
     print(_SEP)
 
-    print("  Next:")
-    if s["pending_apply"]:
-        print(f"    rh apply {name} --dry-run     preview {s['pending_apply']} rename(s)")
-    if s["analyzed"]:
-        print(f'    rh ask {name} "<question>"    search the analysis')
-    print(f"    rh map {name} --suspicious    find the next thing to analyze")
-    print(f"    rh menu {name}                interactive session\n")
+    if show_next:
+        print(f"  Next:  python rh.py {name}\n")
