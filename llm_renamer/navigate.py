@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from collections import deque
 
-from .call_graph import CallGraph, CallNode
+from .call_graph import CallGraph
 from .scorer import depth_from_leaves, score_node
 
 # Names IDA gives to things that start execution.
@@ -28,23 +28,21 @@ _ENTRY_NAMES = (
 # Selection primitives
 # ---------------------------------------------------------------------------
 
-def descendants(graph: CallGraph, addr: int, depth: int = 2) -> list[int]:
-    """`addr` plus everything it calls, up to `depth` hops down."""
+def descendants(graph: CallGraph, addr: int, depth: int | None = 2) -> list[int]:
+    """`addr` plus everything it calls, up to `depth` hops down.
+
+    `depth=None` walks all the way to true leaves (cycle-safe via `seen`).
+    """
     return _bfs(graph, addr, depth, graph.callees_of)
 
 
-def ancestors(graph: CallGraph, addr: int, depth: int = 2) -> list[int]:
-    """`addr` plus everything that calls it, up to `depth` hops up."""
-    return _bfs(graph, addr, depth, graph.callers_of)
-
-
-def _bfs(graph: CallGraph, start: int, depth: int, neighbours) -> list[int]:
+def _bfs(graph: CallGraph, start: int, depth: int | None, neighbours) -> list[int]:
     seen = {start}
     order = [start]
     frontier = deque([(start, 0)])
     while frontier:
         node, d = frontier.popleft()
-        if d >= depth:
+        if depth is not None and d >= depth:
             continue
         for nxt in neighbours(node):
             if nxt in seen or nxt not in graph.nodes:
@@ -53,6 +51,35 @@ def _bfs(graph: CallGraph, start: int, depth: int, neighbours) -> list[int]:
             order.append(nxt)
             frontier.append((nxt, d + 1))
     return order
+
+
+def full_subtree(graph: CallGraph, addrs: list[int]) -> list[int]:
+    """
+    `addrs` plus the FULL callee subtree of each, down to true leaves.
+
+    This is the project's standard scope-expansion pattern, used everywhere a
+    scope selects a set of "targets": `-f`, `--top N`. Never hand the LLM a
+    target whose real dependencies aren't
+    also in scope to be analyzed first, leaves-first (`build_worklist`
+    already orders any selection bottom-up) -- a target analyzed against bare,
+    unsummarized callee names instead of real summaries measurably hurts
+    confidence and grounding, exactly the failure mode a partial one-hop
+    expansion (the previous approach here) still left open for anything
+    beyond the immediate neighbours.
+
+    Callers are handled separately (`prompts.build_user_prompt` injects KB
+    summaries for whichever direct callers are already analyzed) rather than
+    walked upward here -- this function is specifically the *downward*, to-
+    the-leaves half of the pattern.
+    """
+    expanded = list(addrs)
+    seen = set(addrs)
+    for a in addrs:
+        for d in descendants(graph, a, depth=None):
+            if d not in seen:
+                seen.add(d)
+                expanded.append(d)
+    return expanded
 
 
 def shortest_path(graph: CallGraph, src: int, dst: int,
@@ -82,30 +109,6 @@ def _rebuild(prev: dict[int, int], src: int, dst: int) -> list[int]:
         path.append(prev[path[-1]])
     path.reverse()
     return path
-
-
-def paths_between(graph: CallGraph, src: int, dst: int,
-                  max_depth: int = 12, max_paths: int = 10) -> list[list[int]]:
-    """
-    Up to `max_paths` distinct call paths src → dst, shortest first.
-    Bounded on purpose: a dense graph has effectively unlimited paths.
-    """
-    results: list[list[int]] = []
-    stack = [(src, [src])]
-    while stack and len(results) < max_paths:
-        node, path = stack.pop(0)
-        if len(path) > max_depth:
-            continue
-        for nxt in graph.callees_of(node):
-            if nxt in path or nxt not in graph.nodes:
-                continue
-            if nxt == dst:
-                results.append(path + [nxt])
-                if len(results) >= max_paths:
-                    break
-            else:
-                stack.append((nxt, path + [nxt]))
-    return results
 
 
 # ---------------------------------------------------------------------------
@@ -149,9 +152,14 @@ def paths_to_sinks(graph: CallGraph, config: dict, *, limit: int = 15,
     if not sources:
         return []
 
+    # Depth term included to match top_scored()/build_worklist()'s own
+    # "score" formula -- score_node() alone is a different, incomplete
+    # ranking (confirmed real 2026-08-16: this used to silently diverge
+    # from what "score" means everywhere else in the tool).
+    depths = depth_from_leaves(graph)
     ranked = sorted(
         sink_callers(graph),
-        key=lambda a: score_node(graph.nodes[a], config),
+        key=lambda a: score_node(graph.nodes[a], config) + float(depths.get(a, 0)),
         reverse=True,
     )
 
@@ -216,18 +224,101 @@ def top_scored(graph: CallGraph, config: dict, n: int = 50) -> list[int]:
 
 
 def unnamed_only(graph: CallGraph, addresses: list[int], config: dict) -> list[int]:
-    """Filter a selection down to still-auto-named functions."""
-    prefixes = tuple(config["policy"]["auto_generated_prefixes"])
+    """Filter a selection down to analysis candidates (still-unnamed `sub_`)."""
+    prefixes = tuple(config["policy"].get("analysis_candidate_prefixes", ["sub_"]))
     return [a for a in addresses
             if a in graph.nodes and graph.nodes[a].name.startswith(prefixes)]
+
+
+def resolve_one(
+    graph: CallGraph | None, name: str, extractor=None, config: dict | None = None,
+    workspace=None,
+) -> int | None:
+    """
+    Turn typed input (a name or `0xADDR`) into an address: hex-parse,
+    exact-match, partial-match, then an extractor/KB fallback chain.
+    """
+    if name.lower().startswith("0x"):
+        try:
+            return int(name, 16)
+        except ValueError:
+            pass
+    if graph is not None:
+        exact = [a for a, n in graph.nodes.items() if n.name == name]
+        if exact:
+            return exact[0]
+        partial = [a for a, n in graph.nodes.items() if name.lower() in n.name.lower()]
+        if len(partial) == 1:
+            return partial[0]
+        if len(partial) > 1:
+            print(f"  {name!r} matches {len(partial)} functions — showing the first 10:")
+            for a in partial[:10]:
+                print(describe(graph, a, config))
+            return None
+    if extractor is not None:
+        rows = extractor.get_functions_by_name([name])
+        if rows:
+            return int(rows[0]["address"])
+    if workspace is not None:
+        addr = _resolve_via_kb(workspace, name)
+        if addr is not None:
+            return addr
+    print(f"  Not found: {name!r}")
+    return None
+
+
+def _resolve_via_kb(workspace, name: str) -> int | None:
+    """
+    Fall back to the knowledge base's new_name -> address mapping.
+
+    The cached call graph only knows each function's name as of the last
+    `map --build`; anything renamed and applied since then is invisible to
+    it, and `map` commands never open IDA (no extractor fallback either) --
+    so without this, a function becomes unfindable by name the moment you
+    rename it. The KB is updated the instant `apply` runs and needs no IDA
+    session to query.
+    """
+    import os
+    if not os.path.exists(workspace.kb):
+        return None
+    from .kb import KnowledgeBase
+    kb = KnowledgeBase(workspace.kb)
+    try:
+        matches = [r for r in kb.get_all() if r.get("new_name") == name]
+        if len(matches) == 1:
+            try:
+                return int(matches[0]["address"], 16)
+            except (TypeError, ValueError):
+                return None
+        if len(matches) > 1:
+            print(f"  {name!r} matches {len(matches)} applied renames — be more specific.")
+        return None
+    finally:
+        kb.close()
 
 
 # ---------------------------------------------------------------------------
 # Display
 # ---------------------------------------------------------------------------
 
-def describe(graph: CallGraph, addr: int, config: dict | None = None) -> str:
-    """One dense line about a function, from graph data only."""
+def describe(graph: CallGraph, addr: int, config: dict | None = None,
+             name_override: str | None = None,
+             depths: dict[int, int] | None = None) -> str:
+    """One dense line about a function.
+
+    `name_override` lets a caller show the function's *current* name (from the
+    knowledge base) instead of the graph's cached one -- the cached graph only
+    knows names as of the last `map --build`, so without this a function you've
+    already renamed still displays as `sub_...` in every map view, which reads
+    as the tool having forgotten what you just did.
+
+    `depths` (from `scorer.depth_from_leaves`) adds the depth-from-nearest-leaf
+    term to the displayed score, matching what `top_scored`/`build_worklist`
+    actually rank by -- omitted here (falls back to depth-excluded), the
+    printed score can be non-monotonic against a "Top N by score" view's own
+    sort order (confirmed real 2026-08-16: describe() and top_scored() used
+    to compute genuinely different formulas for the same "score").
+    """
     node = graph.nodes.get(addr)
     if node is None:
         return f"0x{addr:X}  (not in graph)"
@@ -236,8 +327,13 @@ def describe(graph: CallGraph, addr: int, config: dict | None = None) -> str:
         flags.append("INPUT")
     if node.dangerous_sink_calls:
         flags.append("SINK:" + ",".join(node.dangerous_sink_calls[:3]))
-    score = f"{score_node(node, config):>5.1f}" if config else "     "
-    return (f"  0x{addr:<12X} {node.name[:34]:<34} {score}  "
+    if config:
+        total = score_node(node, config) + float((depths or {}).get(addr, 0))
+        score = f"{total:>5.1f}"
+    else:
+        score = "     "
+    display_name = name_override or node.name
+    return (f"  0x{addr:<12X} {display_name[:34]:<34} {score}  "
             f"callers={node.caller_count:<5} bb={node.basic_block_count:<4} "
             f"{' '.join(flags)}")
 

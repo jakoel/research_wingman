@@ -1,11 +1,44 @@
 {
   "ollama": {
     "url": "http://localhost:11434",
-    "model": "codellama:13b-instruct",
-    "embed_model": "nomic-embed-text"
+    "model": "gemma4:26b",
+    "embed_model": "nomic-embed-text",
+    "timeout_seconds": 300,
+    "temperature": 0.05
   },
   "analysis": {
-    "confidence_threshold": 0.65,
-    "skip_high_risk": true
+    "confidence_threshold": 0.6,
+    "skip_high_risk": true,
+    "high_risk_confidence_override": 0.7,
+    "max_pseudocode_lines": 1000,
+    "max_imported_apis_shown": 40,
+    "max_referenced_strings_shown": 40,
+    "max_code_referrers_shown": 20,
+    "max_unanalyzed_neighbours_shown": 5,
+    "max_call_site_snippet_lines": 20,
+    "max_related_summary_chars": 160
+  },
+  "graph": {
+    "dangerous_sinks": [
+      "memcpy", "memmove", "strcpy", "strcat", "sprintf", "vsprintf",
+      "gets", "recv", "recvfrom", "read", "malloc", "realloc", "free",
+      "RtlCopyMemory", "RtlMoveMemory", "RtlCompareMemory",
+      "ProbeForRead", "ProbeForWrite", "MmProbeAndLockPages",
+      "ExAllocatePoolWithTag", "ExFreePoolWithTag"
+    ],
+    "max_import_refs_per_node": 20,
+    "max_string_refs_per_node": 20,
+    "max_constant_operands_per_node": 64
+  },
+  "scoring": {
+    "candidate_pool_multiplier": 3
+  },
+  "kb": {
+    "repair_max_rounds": 3,
+    "refinement_confidence_skip": 0.7,
+    "duplicate_name_max_group_size": 3
+  },
+  "search": {
+    "semantic_candidate_pool_multiplier": 4
   }
 }

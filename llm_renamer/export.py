@@ -2,7 +2,7 @@
 Review export.
 
 The review file is a *view* of the knowledge base, generated on demand. It is
-never read back — `rh apply` works straight from the knowledge base — so it
+never read back — `research_wingman.py apply` works straight from the knowledge base — so it
 cannot drift out of sync with the real state.
 """
 
@@ -27,11 +27,13 @@ def export_review(kb: KnowledgeBase, path: str) -> int:
             "reason":            r.get("reason") or "",
             "summary":           r.get("summary") or "",
             "security_relevant": bool(r.get("security_relevant")),
-            "evidence":          r.get("evidence") or {},
+            "interesting_behaviors": r.get("interesting_behaviors") or [],
             "status":            r.get("status") or "",
             "rejection_reason":  r.get("rejection_reason") or "",
             "applied":           bool(r.get("applied")),
             "applied_name":      r.get("applied_name") or "",
+            "num_ctx_used":      r.get("num_ctx_used"),
+            "prompt_chars":      r.get("prompt_chars"),
         }
         for r in rows
         if r.get("analyzed")

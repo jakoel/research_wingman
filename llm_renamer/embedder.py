@@ -2,7 +2,7 @@
 Local embedding + FAISS vector index.
 
 Embeds function summaries via Ollama into a FAISS flat cosine-similarity index
-so `rh ask` can answer free-text questions like "user-controlled length without
+so `research_wingman.py ask` can answer free-text questions like "user-controlled length without
 bounds check". The index is rebuilt automatically when it falls behind the
 knowledge base.
 
@@ -11,6 +11,7 @@ Requires: pip install faiss-cpu numpy
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import urllib.error
@@ -19,7 +20,7 @@ import urllib.request
 
 try:
     import numpy as np
-    import faiss as _faiss
+    import faiss
     _AVAILABLE = True
 except ImportError:
     _AVAILABLE = False
@@ -53,8 +54,10 @@ class Embedder:
         self._timeout = int(config["ollama"].get("timeout_seconds", 120))
         self._index_path = index_path
         self._map_path = index_path + ".map"
+        self._sig_path = index_path + ".sig"
         self._index = None
         self._id_map: list[str] = []
+        self._signature: str | None = None
 
     # ------------------------------------------------------------------
     # Build
@@ -67,6 +70,7 @@ class Embedder:
 
         vectors: list[list[float]] = []
         addresses: list[str] = []
+        embedded_entries: list[dict] = []
         total = len(entries)
 
         for i, entry in enumerate(entries):
@@ -78,6 +82,7 @@ class Embedder:
                 vec = self._embed(text)
                 vectors.append(vec)
                 addresses.append(str(entry["address"]))
+                embedded_entries.append(entry)
             except Exception as e:
                 print(f"[embedder] WARNING: embed failed for {entry['address']}: {e}")
             if (i + 1) % 100 == 0 or (i + 1) == total:
@@ -86,6 +91,15 @@ class Embedder:
         if not vectors:
             print("[embedder] No vectors produced — index not built.")
             return
+
+        # Signature computed from what actually made it into the index, not
+        # the full input list -- if some embed calls failed above (e.g. a
+        # transient network error), a signature over the full input would
+        # match on the next run's unchanged KB rows even though the failed
+        # entries are still permanently missing, so the index would look
+        # "fresh" and never get a chance to retry them (short of deleting
+        # the .faiss files by hand). Confirmed real gap 2026-08-16.
+        self._signature = self.content_signature(embedded_entries)
 
         matrix = np.array(vectors, dtype=np.float32)
         faiss.normalize_L2(matrix)
@@ -107,10 +121,57 @@ class Embedder:
     # ------------------------------------------------------------------
 
     def _save(self) -> None:
+        # Atomic: write every file to a .tmp path, then rename into place
+        # only after ALL writes succeed -- same pattern as CallGraph.save().
+        # A crash/interrupt mid-save previously could leave a written
+        # .faiss index paired with a stale or missing .map, desyncing FAISS
+        # row positions from the address list search() trusts 1:1.
+        # Confirmed real risk 2026-08-16 (only on crash/interrupt, not
+        # normal control flow).
         import faiss
-        faiss.write_index(self._index, self._index_path)
-        with open(self._map_path, "w", encoding="utf-8") as f:
+        index_tmp = self._index_path + ".tmp"
+        map_tmp = self._map_path + ".tmp"
+        faiss.write_index(self._index, index_tmp)
+        with open(map_tmp, "w", encoding="utf-8") as f:
             json.dump(self._id_map, f)
+        if self._signature is not None:
+            sig_tmp = self._sig_path + ".tmp"
+            with open(sig_tmp, "w", encoding="utf-8") as f:
+                f.write(self._signature)
+            os.replace(sig_tmp, self._sig_path)
+        os.replace(index_tmp, self._index_path)
+        os.replace(map_tmp, self._map_path)
+
+    # ------------------------------------------------------------------
+    # Content signature — freshness that tracks *content*, not just count
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def content_signature(entries: list[dict]) -> str:
+        """
+        A hash of exactly what would be embedded — the (address, embed-text)
+        of every entry with a summary, sorted by address. Any add, edit
+        (refinement / --redo changing a summary), or removal changes this,
+        so freshness catches content changes a plain count comparison misses.
+        """
+        items = sorted(
+            (str(e["address"]), _entry_to_text(e))
+            for e in entries if (e.get("summary") or "")
+        )
+        h = hashlib.sha1()
+        for addr, text in items:
+            h.update(addr.encode("utf-8"))
+            h.update(b"\x00")
+            h.update(text.encode("utf-8"))
+            h.update(b"\x01")
+        return h.hexdigest()
+
+    def stored_signature(self) -> str | None:
+        try:
+            with open(self._sig_path, "r", encoding="utf-8") as f:
+                return f.read().strip()
+        except OSError:
+            return None
 
     def load(self) -> bool:
         """Load index from disk. Returns True on success."""

@@ -5,7 +5,14 @@ Usage (context manager):
     with AuditLogger(path) as log:
         log.record(...)
 
-Every processed function produces exactly one record.
+One record per action taken (an analyze decision, or an apply attempt) --
+NOT a restatement of the analysis itself. Confidence/risk/reason/summary
+already live in the knowledge base (current state) and llm_responses.json
+(raw model output, every call, both analyze and refine phases) -- repeating
+them here was pure duplication with no audit value of its own. What this
+file uniquely provides is a permanent, append-only *timeline* of decisions
+across every run ever done on this database (the KB only ever holds the
+latest row per address), tagged with which phase produced them.
 """
 
 import json
@@ -33,43 +40,35 @@ class AuditLogger:
         *,
         address: str,
         old_name: str,
-        suggested_name: str,
-        final_name: str,
-        confidence: float,
-        risk: str,
-        reason: str,
-        applied: bool,
-        rejection_reason: str = "",
-        error: str = "",
+        phase: str,
+        status: str,
+        new_name: str = "",
+        detail: str = "",
     ) -> None:
+        """
+        phase: "analyze" (an LLM proposal was accepted/rejected) or
+               "apply" (a write to the .i64 was attempted).
+        status: phase="analyze" -> "approved" | "rejected" | "error"
+                phase="apply"   -> "applied" | "skip" | "fail" | "error"
+                (the same vocabulary _apply_one() already returns, so callers
+                pass its result straight through instead of re-deriving it)
+        detail: short reason/rejection_reason/error text -- not the LLM's
+                full-prose `reason`, which belongs to the KB/llm_responses.json.
+        """
         entry = {
             "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "address": address,
             "old_name": old_name,
-            "suggested_name": suggested_name,
-            "final_name": final_name,
-            "confidence": confidence,
-            "risk": risk,
-            "reason": reason,
-            "applied": applied,
-            "rejection_reason": rejection_reason,
-            "error": error,
+            "phase": phase,
+            "status": status,
+            "new_name": new_name,
+            "detail": detail,
         }
         self._write(entry)
 
-    def record_error(self, *, address: str, name: str, error: str) -> None:
-        self.record(
-            address=address,
-            old_name=name,
-            suggested_name="",
-            final_name="",
-            confidence=0.0,
-            risk="",
-            reason="",
-            applied=False,
-            rejection_reason="",
-            error=error,
-        )
+    def record_error(self, *, address: str, old_name: str, phase: str, error: str) -> None:
+        self.record(address=address, old_name=old_name, phase=phase,
+                    status="error", detail=error)
 
     # ------------------------------------------------------------------
 

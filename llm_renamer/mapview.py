@@ -13,7 +13,8 @@ import os
 
 from . import navigate
 from .call_graph import CallGraph
-from .kb import KnowledgeBase
+from .kb import KnowledgeBase, addr_to_hex
+from .scorer import depth_from_leaves
 from .workspace import Workspace
 
 _SEP = "─" * 76
@@ -21,9 +22,9 @@ _SEP = "─" * 76
 
 def load_graph(workspace: Workspace) -> CallGraph | None:
     if not workspace.has_graph():
-        print(f"[rh] No call graph yet for {os.path.basename(workspace.db_path)}.")
-        print("[rh] Build it once (needs IDA, takes minutes):  "
-              f"rh map {os.path.basename(workspace.db_path)} --build")
+        print(f"[wingman] No call graph yet for {os.path.basename(workspace.db_path)}.")
+        print("[wingman] Build it once (needs IDA, takes minutes):  "
+              f"research_wingman.py map {os.path.basename(workspace.db_path)} --build")
         return None
     return CallGraph.load(workspace.call_graph)
 
@@ -40,13 +41,22 @@ def _kb_map(workspace: Workspace, addresses) -> dict[str, dict]:
     return {r["address"]: r for r in rows}
 
 
-def _line(graph: CallGraph, addr: int, config: dict, known: dict) -> str:
-    out = navigate.describe(graph, addr, config)
-    entry = known.get(f"0x{addr:X}")
+def _line(graph: CallGraph, addr: int, config: dict, known: dict,
+          depths: dict[int, int] | None = None) -> str:
+    entry = known.get(addr_to_hex(addr))
+    # Show the current (KB) name on the primary line when we have one, so a
+    # map view reflects what you've learned rather than the stale graph name.
+    name_override = None
     if entry:
-        name = entry.get("new_name") or entry.get("old_name") or ""
-        flag = " [SEC]" if entry.get("security_relevant") else ""
-        out += f"\n{'':>17}→ {name}{flag}: {entry.get('summary') or ''}"
+        name_override = entry.get("new_name") or entry.get("old_name") or None
+    out = navigate.describe(graph, addr, config, name_override=name_override,
+                            depths=depths)
+    if entry:
+        if entry.get("security_relevant"):
+            out += " [SEC]"   # triage marker, doubles as a scan cue in lists
+        summary = (entry.get("summary") or "").strip()
+        if summary:
+            out += f"\n{'':>17}{summary}"
     return out
 
 
@@ -54,12 +64,17 @@ def _render(graph: CallGraph, addresses, config: dict,
             workspace: Workspace, title: str, limit: int = 40) -> None:
     addresses = list(addresses)[:limit]
     known = _kb_map(workspace, addresses)
+    # Computed once per render call, not per line -- depth_from_leaves walks
+    # the whole graph, so per-line would be O(n^2) over a large map view.
+    # Needed so the printed score matches what top_scored() actually sorted
+    # by (see navigate.describe's docstring).
+    depths = depth_from_leaves(graph)
     print(f"\n{title}")
     print(_SEP)
     if not addresses:
         print("  (nothing)")
     for addr in addresses:
-        print(_line(graph, addr, config, known))
+        print(_line(graph, addr, config, known, depths=depths))
     print(_SEP)
     print(f"  {len(addresses)} shown")
 
@@ -92,6 +107,13 @@ def overview(graph: CallGraph, config: dict, workspace: Workspace) -> None:
     print(f"  Entry points       : {len(entries)}")
     print(f"  Call a memory sink : {len(sinks)}")
     print(f"  Input-reachable    : {len(inputs)}")
+    if not sinks and not inputs and not any(n.import_refs for n in nodes.values()):
+        print("  NOTE: no imports at all were recognized -- this looks "
+              "statically linked. Sink/input-reachable scoring is import-name-\n"
+              "        driven and cannot see anything on a binary like this, "
+              "so those 0s mean \"undetectable\", not \"absent\". --suspicious\n"
+              "        still works (structure-based), but treat it as the "
+              "only free signal available, not confirmation nothing's dangerous.")
     print(_SEP)
 
     known = _kb_map(workspace, entries[:10])
@@ -111,7 +133,8 @@ def overview(graph: CallGraph, config: dict, workspace: Workspace) -> None:
 
 def suspicious(graph: CallGraph, config: dict, workspace: Workspace,
                top: int = 25, unnamed_only: bool = False) -> list[int]:
-    addresses = navigate.top_scored(graph, config, top * 3)
+    pool_multiplier = int(config.get("scoring", {}).get("candidate_pool_multiplier", 3))
+    addresses = navigate.top_scored(graph, config, top * pool_multiplier)
     if unnamed_only:
         addresses = navigate.unnamed_only(graph, addresses, config)
     addresses = addresses[:top]
@@ -153,14 +176,17 @@ def explore(graph: CallGraph, config: dict, workspace: Workspace,
     """Everything the graph knows about one function, plus its neighbours."""
     node = graph.nodes.get(addr)
     if node is None:
-        print(f"[rh] 0x{addr:X} is not in the call graph.")
+        print(f"[wingman] 0x{addr:X} is not in the call graph.")
         return
 
     callers = graph.callers_of(addr)
     callees = graph.callees_of(addr)
     known = _kb_map(workspace, [addr] + callers + callees)
 
-    print(f"\n  0x{addr:X}  {node.name}")
+    self_entry = known.get(addr_to_hex(addr))
+    header_name = (self_entry.get("new_name") or self_entry.get("old_name")
+                   if self_entry else None) or node.name
+    print(f"\n  0x{addr:X}  {header_name}")
     print(_SEP)
     print(f"  Size {node.size_bytes} bytes · {node.basic_block_count} basic blocks "
           f"· {node.caller_count} caller(s)")
@@ -175,7 +201,7 @@ def explore(graph: CallGraph, config: dict, workspace: Workspace,
         for s in node.string_refs[:8]:
             print(f"    {s[:70]!r}")
 
-    entry = known.get(f"0x{addr:X}")
+    entry = known.get(addr_to_hex(addr))
     if entry:
         print(_SEP)
         print(f"  Analyzed: {entry.get('new_name') or entry.get('old_name')}"

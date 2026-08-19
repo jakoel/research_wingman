@@ -4,11 +4,12 @@ Workspace — resolves where a database's analysis state lives.
 All state for a database lives in one directory next to the database itself:
 
     /path/to/target.i64
-    /path/to/target.i64.rh/
+    /path/to/target.i64.wingman/
         knowledge_base.sqlite     analysis results — the single source of truth
         call_graph.json           cached call graph
         kb_vectors.faiss  (.map)  semantic index
         audit.jsonl               append-only log of every action taken
+        llm_responses.json        every raw LLM response, verbatim
         review.json               exported on demand, never read back
 
 State follows the binary rather than the current working directory, so running
@@ -20,7 +21,7 @@ from __future__ import annotations
 
 import os
 
-SUFFIX = ".rh"
+SUFFIX = ".wingman"
 
 _LEGACY_FILENAMES = (
     "knowledge_base.sqlite",
@@ -34,6 +35,18 @@ class Workspace:
     """Owns every path derived from a database location."""
 
     def __init__(self, db_path: str, dir_override: str | None = None) -> None:
+        # KNOWN RISK, not fixed here: on a case-insensitive, case-preserving
+        # filesystem (default Windows/macOS), two paths differing only in
+        # case (`Target.i64` vs `target.i64`) produce different `self.dir`
+        # STRINGS that resolve to the SAME directory on disk -- two
+        # "different" databases by this code's own string logic would
+        # silently share one knowledge base. Not normalized here on purpose:
+        # doing so would change the derived directory name for any EXISTING
+        # differently-cased workspace already on disk, which is the exact
+        # "silently start from an empty knowledge base" failure this module
+        # exists to prevent, just moved to the fix itself. Safe to normalize
+        # (e.g. via os.path.normcase) only alongside a real migration of any
+        # existing `<path>.wingman` directories to the normalized name.
         self.db_path = os.path.abspath(db_path)
         self.dir = (
             os.path.abspath(dir_override) if dir_override
@@ -59,6 +72,10 @@ class Workspace:
     @property
     def audit(self) -> str:
         return self._p("audit.jsonl")
+
+    @property
+    def llm_responses(self) -> str:
+        return self._p("llm_responses.json")
 
     @property
     def review(self) -> str:
@@ -100,9 +117,9 @@ def warn_if_legacy_state_nearby(workspace: Workspace) -> None:
     if not stray:
         return
     print(
-        f"[rh] NOTE: found older state in the current directory "
+        f"[wingman] NOTE: found older state in the current directory "
         f"({', '.join(stray)}).\n"
-        f"[rh]       State now lives in {workspace.dir}\n"
-        f"[rh]       To reuse the old results, move those files there; "
+        f"[wingman]       State now lives in {workspace.dir}\n"
+        f"[wingman]       To reuse the old results, move those files there; "
         f"otherwise analysis starts fresh."
     )

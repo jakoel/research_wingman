@@ -1,5 +1,5 @@
 # Analysis workspaces — one per database, created next to the .i64
-*.rh/
+*.wingman/
 
 # IDA databases and their working files
 *.i64
@@ -15,3 +15,6 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
+
+# Personal machine setup notes -- never meant to be shared
+*.local.md
